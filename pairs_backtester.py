@@ -163,7 +163,7 @@ def calc_continuous_threshold(confidence, quality_score, hurst, timeframe='4h'):
     base = base_map.get(timeframe, base_map['4h']).get(confidence, 2.5)
     q_adj = max(0, (quality_score - 50)) / 250.0
     h_adj = 0.50 if hurst >= 0.45 else 0.0 if hurst >= 0.35 else -0.05 if hurst >= 0.20 else -0.10
-    return round(max(1.2, min(3.5, base - q_adj + h_adj)), 2)
+    return round(max(1.5, min(3.5, base - q_adj + h_adj)), 2)
 
 
 # ═══════════════════════════════════════════════════════
@@ -708,12 +708,20 @@ elif mode == "🔄 Автоскан":
                 usdt = {k: v for k, v in tickers.items() 
                        if '/USDT' in k and ':' not in k}
                 
+                # v5.0: Exclude stablecoins and wrapped tokens
+                EXCLUDE = {'USDC', 'USDT', 'USDG', 'DAI', 'TUSD', 'BUSD', 'FDUSD',
+                           'STETH', 'WSTETH', 'WETH', 'WBTC', 'CBETH', 'RETH',
+                           'OKSOL', 'JITOSOL', 'MSOL', 'BNSOL'}
+                
                 valid = []
                 for sym, t in usdt.items():
                     try:
+                        coin = sym.replace('/USDT', '')
+                        if coin in EXCLUDE:
+                            continue
                         vol = float(t.get('quoteVolume', 0))
                         if vol > 0:
-                            valid.append((sym.replace('/USDT', ''), vol))
+                            valid.append((coin, vol))
                     except:
                         continue
                 
