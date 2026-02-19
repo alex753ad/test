@@ -144,13 +144,26 @@ def calc_hurst(series, min_window=8):
 
 
 def calc_confidence(hurst, pvalue, stability_ratio=0.75):
+    """v11.0: Hurst hard gate — Hurst>=0.45 → max MEDIUM."""
     checks = 0
     if hurst < 0.40: checks += 1
     if pvalue < 0.03: checks += 1
     if stability_ratio >= 0.75: checks += 1
-    if checks >= 2: return 'HIGH'
+    hurst_is_bad = hurst >= 0.45
+    if checks >= 2 and not hurst_is_bad: return 'HIGH'
     if checks >= 1: return 'MEDIUM'
     return 'LOW'
+
+
+def calc_continuous_threshold(confidence, quality_score, hurst, timeframe='4h'):
+    """v11.0: Continuous threshold (не дискретные 1.5/2.0/2.5)."""
+    base_map = {'1h': {'HIGH': 1.8, 'MEDIUM': 2.3, 'LOW': 2.8},
+                '4h': {'HIGH': 1.5, 'MEDIUM': 2.0, 'LOW': 2.5},
+                '1d': {'HIGH': 1.3, 'MEDIUM': 1.8, 'LOW': 2.3}}
+    base = base_map.get(timeframe, base_map['4h']).get(confidence, 2.5)
+    q_adj = max(0, (quality_score - 50)) / 250.0
+    h_adj = 0.50 if hurst >= 0.45 else 0.0 if hurst >= 0.35 else -0.05 if hurst >= 0.20 else -0.10
+    return round(max(1.2, min(3.5, base - q_adj + h_adj)), 2)
 
 
 # ═══════════════════════════════════════════════════════
@@ -196,16 +209,16 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
     
     hurst = calc_hurst(spread)
     
-    # Confidence → adaptive thresholds
+    # Confidence → adaptive thresholds (v5.0: continuous)
     confidence = calc_confidence(hurst, pvalue)
     
     if adaptive_entry:
-        if confidence == 'HIGH':
-            entry_z = 1.5
-        elif confidence == 'MEDIUM':
-            entry_z = 2.0
-        else:
-            entry_z = 2.5
+        entry_z = calc_continuous_threshold(confidence, 
+                                           max(0, int(100 - pvalue * 200 - max(0, hurst - 0.35) * 200)),
+                                           hurst, timeframe)
+    
+    # v5.0: Adaptive stop — at least 2.0 Z-units beyond entry threshold
+    adaptive_stop = max(entry_z + 2.0, stop_z)
     
     # Adaptive min_hold from HL
     if hl_bars and hl_bars < 50:
@@ -227,6 +240,7 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
         'hr': kf['hr'],
         'confidence': confidence,
         'entry_z_used': entry_z,
+        'stop_z_used': adaptive_stop,
         'min_hold': min_hold,
         'cooldown': cooldown,
         'z_window': z_window,
@@ -311,10 +325,10 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
                 elif position['direction'] == 'SHORT' and z < -1.0:
                     exit_type = 'OVERSHOOT'
             
-            # Stop loss (always active)
-            if position['direction'] == 'LONG' and z < -(stop_z):
+            # Stop loss (always active) — v5.0: uses adaptive stop
+            if position['direction'] == 'LONG' and z < -(adaptive_stop):
                 exit_type = 'STOP_LOSS'
-            elif position['direction'] == 'SHORT' and z > stop_z:
+            elif position['direction'] == 'SHORT' and z > adaptive_stop:
                 exit_type = 'STOP_LOSS'
             
             # Max hold
@@ -436,7 +450,7 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
 
 st.set_page_config(page_title="Pairs Backtester", page_icon="📊", layout="wide")
 st.title("📊 Pairs Trading Backtester")
-st.caption("v4.0 | Kalman HR + MAD Z-Score + Walk-Forward + Pre-Trade Filters + HL Fix + Adaptive entry_z")
+st.caption("v5.0 | Continuous Threshold + Hurst Gate + Adaptive Stop + HL Fix")
 
 # Sidebar
 with st.sidebar:
