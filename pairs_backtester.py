@@ -1,1399 +1,821 @@
 """
-Pairs Trading Backtester v3.0
-ИЗМЕНЕНИЯ v3.0 (от v2.0):
-  [CRITICAL] Half-life: исправлено halflife_ou * 24 (был в ДНЯХ, использовался как ЧАСЫ)
-  [CRITICAL] Pre-trade фильтры: Hurst < 0.45, p-value < 0.05, 1 < HL_bars < 50
-  [CRITICAL] Адаптивный entry_z из confidence (HIGH→1.5, MED→2.0, LOW→2.5)
-  [IMPORTANT] min_hold адаптивный: max(3, int(HL_bars * 0.5))
-  [IMPORTANT] Cooldown: max(3, int(HL_bars * 0.75)) баров после закрытия
-  [IMPORTANT] Фильтр корреляции ρ ≥ 0.3
+Pairs Trading Backtester v4.0
+Kalman HR + MAD Z-Score + Walk-Forward + Pre-Trade Filters + HL Fix + Adaptive entry_z
 
-v2.0:
-  [FIX] OVERSHOOT порог: entry_z*0.5 → 0 (выход только при смене знака Z)
-  [FIX] min_hold_bars: добавлен параметр (default=3) — не выходим раньше
-  [FIX] HR filter: 0.01 < |HR| < 20 (отсечка стейблкоинов и экстремальных HR)
-  [FIX] Hurst: единая реализация DFA (min_window=8, R² проверка)
-  [FIX] Half-life: через OU параметры (как в сканере), а не OLS
-  [FIX] Фиксированный Kalman в сделке: HR/intercept не меняется пока в позиции
-  [NEW] Cooldown: пропуск N баров после закрытия сделки
-  [NEW] Улучшенная палитра: зелёный/красный для P&L, цветовые зоны на графиках
-  [NEW] Метрики качества — цвет по порогам (хорошо/средне/плохо)
+v4.0 Changes:
+  [FIX] HL: dt = hours_per_bar / 24 (в днях, как в сканере) — HL теперь 5-30ч, не 0.1ч
+  [FIX] Exchange fallback chain: OKX→KuCoin→Bybit→Binance (cloud-safe)
+  [NEW] Pre-trade filters: Hurst < 0.45, P-value < 0.05, 1 < HL_bars < 50
+  [NEW] Adaptive entry_z: HIGH→1.5, MEDIUM→2.0, LOW→2.5
+  [NEW] CSV export for all results
+  [NEW] Auto-scan mode: backtest top N pairs from scanner
+  [NEW] Adaptive min_hold = max(3, int(HL_bars * 0.5))
+  [NEW] Cooldown = max(5, int(HL_bars)) bars after close
+
+Запуск: streamlit run pairs_backtester.py
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+import ccxt
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import ccxt
-import time
-from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-from scipy import stats as scipy_stats
+from statsmodels.tsa.stattools import coint
+import warnings
+warnings.filterwarnings('ignore')
 
 # ═══════════════════════════════════════════════════════
-# CORE FUNCTIONS (синхронизированы с mean_reversion_analysis.py v10.5)
+# EXCHANGE FALLBACK
+# ═══════════════════════════════════════════════════════
+EXCHANGE_FALLBACK = ['okx', 'kucoin', 'bybit', 'binance']
+
+def get_exchange(name):
+    tried = set()
+    chain = [name] + [e for e in EXCHANGE_FALLBACK if e != name]
+    for exch in chain:
+        if exch in tried: continue
+        tried.add(exch)
+        try:
+            ex = getattr(ccxt, exch)({'enableRateLimit': True})
+            ex.load_markets()
+            if exch != name:
+                st.warning(f"⚠️ {name.upper()} недоступен. Переключился на **{exch.upper()}**")
+            return ex, exch
+        except:
+            continue
+    return None, None
+
+# ═══════════════════════════════════════════════════════
+# MATH FUNCTIONS (standalone — no external dependencies)
 # ═══════════════════════════════════════════════════════
 
-def kalman_hedge_ratio(series1, series2, delta=1e-4, ve=1e-3):
-    """Kalman Filter для динамического hedge ratio."""
-    s1 = np.array(series1, dtype=float)
-    s2 = np.array(series2, dtype=float)
+def kalman_hr(s1, s2, delta=1e-4, ve=1e-3):
+    s1, s2 = np.array(s1, float), np.array(s2, float)
     n = min(len(s1), len(s2))
-    if n < 10:
-        return None
+    if n < 10: return None
     s1, s2 = s1[:n], s2[:n]
-
     init_n = min(30, n // 3)
     try:
-        X_init = np.column_stack([np.ones(init_n), s2[:init_n]])
-        beta_init = np.linalg.lstsq(X_init, s1[:init_n], rcond=None)[0]
-    except Exception:
-        beta_init = np.array([0.0, 1.0])
-
-    beta = beta_init.copy()
-    P = np.eye(2) * 1.0
-    Q = np.eye(2) * delta
-    R = ve
-
-    hedge_ratios = np.zeros(n)
-    intercepts = np.zeros(n)
-    trading_spread = np.zeros(n)
-
+        X = np.column_stack([np.ones(init_n), s2[:init_n]])
+        beta = np.linalg.lstsq(X, s1[:init_n], rcond=None)[0]
+    except:
+        beta = np.array([0.0, 1.0])
+    P = np.eye(2); Q = np.eye(2) * delta; R = ve
+    hrs, ints, spread = np.zeros(n), np.zeros(n), np.zeros(n)
     for t in range(n):
-        x_t = np.array([1.0, s2[t]])
-        P = P + Q
-        y_hat = x_t @ beta
-        e_t = s1[t] - y_hat
-        S_t = x_t @ P @ x_t + R
-        K_t = P @ x_t / S_t
-        beta = beta + K_t * e_t
-        P = P - np.outer(K_t, x_t) @ P
-        P = (P + P.T) / 2
+        x = np.array([1.0, s2[t]]); P += Q
+        e = s1[t] - x @ beta; S = x @ P @ x + R
+        K = P @ x / S; beta += K * e
+        P -= np.outer(K, x) @ P; P = (P + P.T) / 2
         np.fill_diagonal(P, np.maximum(np.diag(P), 1e-10))
-
-        intercepts[t] = beta[0]
-        hedge_ratios[t] = beta[1]
-        trading_spread[t] = s1[t] - beta[1] * s2[t] - beta[0]
-
-    return {
-        'hedge_ratios': hedge_ratios,
-        'intercepts': intercepts,
-        'spread': trading_spread,
-        'hr_final': float(hedge_ratios[-1]),
-        'intercept_final': float(intercepts[-1]),
-        'hr_std': float(np.sqrt(P[1, 1])),
-    }
+        hrs[t], ints[t] = beta[1], beta[0]
+        spread[t] = s1[t] - beta[1] * s2[t] - beta[0]
+    return {'hrs': hrs, 'intercepts': ints, 'spread': spread,
+            'hr': float(hrs[-1]), 'intercept': float(ints[-1])}
 
 
-def calculate_adaptive_robust_zscore(spread, halflife_bars=None, min_w=10, max_w=60):
-    """MAD-based Z-score с адаптивным окном."""
-    spread = np.array(spread, dtype=float)
-    n = len(spread)
-
-    if halflife_bars is not None and not np.isinf(halflife_bars) and halflife_bars > 0:
-        window = int(np.clip(2.5 * halflife_bars, min_w, max_w))
+def calc_zscore(spread, halflife_bars=None, min_w=10, max_w=60):
+    spread = np.array(spread, float); n = len(spread)
+    if halflife_bars and not np.isinf(halflife_bars) and halflife_bars > 0:
+        w = int(np.clip(2.5 * halflife_bars, min_w, max_w))
     else:
-        window = 30
-
-    if n < window + 1:
-        window = max(10, n // 2)
-        if n < window + 1:
-            s = np.std(spread)
-            zs = (spread - np.mean(spread)) / s if s > 1e-10 else np.zeros_like(spread)
-            return zs, window
-
-    zscore_series = np.full(n, np.nan)
-    for i in range(window, n):
-        lb = spread[i - window:i]
-        med = np.median(lb)
+        w = 30
+    w = min(w, max(10, n // 2))
+    zs = np.full(n, np.nan)
+    for i in range(w, n):
+        lb = spread[i - w:i]; med = np.median(lb)
         mad = np.median(np.abs(lb - med)) * 1.4826
         if mad < 1e-10:
             s = np.std(lb)
-            zscore_series[i] = (spread[i] - np.mean(lb)) / s if s > 1e-10 else 0.0
+            zs[i] = (spread[i] - np.mean(lb)) / s if s > 1e-10 else 0
         else:
-            zscore_series[i] = (spread[i] - med) / mad
-
-    return zscore_series, window
-
-
-def calculate_ou_parameters(spread, dt=1.0):
-    """OU: dX = θ(μ - X)dt + σdW. Возвращает halflife_ou в единицах dt (ДНЯХ если dt в днях)."""
-    try:
-        if len(spread) < 20:
-            return None
-        spread = np.array(spread, dtype=float)
-        y, x = np.diff(spread), spread[:-1]
-        n = len(x)
-        sx, sy = np.sum(x), np.sum(y)
-        sxy, sx2 = np.sum(x * y), np.sum(x ** 2)
-        denom = n * sx2 - sx ** 2
-        if abs(denom) < 1e-10:
-            return None
-        b = (n * sxy - sx * sy) / denom
-        a = (sy - b * sx) / n
-        theta = max(0.001, min(10.0, -b / dt))
-        mu = a / theta if theta > 0 else 0.0
-        sigma = np.std(y - (a + b * x))
-        halflife = np.log(2) / theta if theta > 0 else 999.0
-        ss_tot = np.sum((y - np.mean(y)) ** 2)
-        ss_res = np.sum((y - (a + b * x)) ** 2)
-        r_sq = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        return {
-            'theta': float(theta), 'mu': float(mu), 'sigma': float(sigma),
-            'halflife_ou': float(halflife), 'r_squared': float(r_sq)
-        }
-    except Exception:
-        return None
+            zs[i] = (spread[i] - med) / mad
+    return zs, w
 
 
-def calculate_hurst_exponent(time_series, min_window=8):
-    """DFA Hurst — синхронизировано с mean_reversion_analysis.py v10.5."""
-    ts = np.array(time_series, dtype=float)
-    n = len(ts)
-    if n < 30:
-        return 0.5, True  # (value, is_fallback)
-
-    increments = np.diff(ts)
-    n_inc = len(increments)
-    profile = np.cumsum(increments - np.mean(increments))
-
-    max_window = n_inc // 4
-    if max_window <= min_window:
-        return 0.5, True
-
-    num_points = min(20, max_window - min_window)
-    if num_points < 4:
-        return 0.5, True
-
-    window_sizes = np.unique(
-        np.logspace(np.log10(min_window), np.log10(max_window), num=num_points).astype(int)
-    )
-    window_sizes = window_sizes[window_sizes >= min_window]
-    if len(window_sizes) < 4:
-        return 0.5, True
-
-    fluctuations = []
-    for w in window_sizes:
-        n_seg = n_inc // w
-        if n_seg < 2:
-            continue
-        f2_sum, count = 0.0, 0
-        for seg in range(n_seg):
-            segment = profile[seg * w:(seg + 1) * w]
-            x = np.arange(w, dtype=float)
-            coeffs = np.polyfit(x, segment, 1)
-            f2_sum += np.mean((segment - np.polyval(coeffs, x)) ** 2)
-            count += 1
-        for seg in range(n_seg):
-            start = n_inc - (seg + 1) * w
-            if start < 0:
-                break
-            segment = profile[start:start + w]
-            x = np.arange(w, dtype=float)
-            coeffs = np.polyfit(x, segment, 1)
-            f2_sum += np.mean((segment - np.polyval(coeffs, x)) ** 2)
-            count += 1
-        if count > 0:
-            f_n = np.sqrt(f2_sum / count)
-            if f_n > 1e-15:
-                fluctuations.append((w, f_n))
-
-    if len(fluctuations) < 4:
-        return 0.5, True
-
-    log_n = np.log([f[0] for f in fluctuations])
-    log_f = np.log([f[1] for f in fluctuations])
-
-    try:
-        slope, _, r_value, _, _ = scipy_stats.linregress(log_n, log_f)
-        if r_value ** 2 < 0.70:
-            return 0.5, True
-        return round(max(0.01, min(0.99, slope)), 4), False
-    except Exception:
-        return 0.5, True
+def calc_halflife(spread, dt):
+    """OU halflife через регрессию. dt в днях: 1h→1/24, 4h→1/6, 1d→1."""
+    s = np.array(spread, float)
+    if len(s) < 20: return 999
+    sl, sd = s[:-1], np.diff(s)
+    n = len(sl)
+    sx, sy = np.sum(sl), np.sum(sd)
+    sxy, sx2 = np.sum(sl * sd), np.sum(sl**2)
+    denom = n * sx2 - sx**2
+    if abs(denom) < 1e-10: return 999
+    b = (n * sxy - sx * sy) / denom
+    theta = max(0.001, min(10.0, -b / dt))
+    hl = np.log(2) / theta  # в единицах dt (дни)
+    return float(hl) if hl < 999 else 999
 
 
-def cointegration_test(s1, s2):
-    """Тест Engle-Granger."""
-    from statsmodels.tsa.stattools import coint
-    try:
-        score, pvalue, _ = coint(s1, s2)
-        return pvalue
-    except:
-        return 1.0
+def calc_hurst(series, min_window=8):
+    x = np.array(series, float)
+    x = x[~np.isnan(x)]
+    n = len(x)
+    if n < 50: return 0.5
+    y = np.cumsum(x - np.mean(x))
+    scales, flucts = [], []
+    max_seg = n // 4
+    for seg_len in range(min_window, max_seg + 1, max(1, (max_seg - min_window) // 20)):
+        n_segs = n // seg_len
+        if n_segs < 2: continue
+        f2_list = []
+        for i in range(n_segs):
+            seg = y[i * seg_len:(i + 1) * seg_len]
+            t = np.arange(len(seg))
+            if len(seg) < 2: continue
+            coeffs = np.polyfit(t, seg, 1)
+            f2_list.append(np.mean((seg - np.polyval(coeffs, t)) ** 2))
+        if f2_list:
+            scales.append(seg_len)
+            flucts.append(np.sqrt(np.mean(f2_list)))
+    if len(scales) < 4: return 0.5
+    log_s, log_f = np.log(scales), np.log(np.array(flucts) + 1e-10)
+    coeffs = np.polyfit(log_s, log_f, 1)
+    pred = np.polyval(coeffs, log_s)
+    ss_res = np.sum((log_f - pred) ** 2)
+    ss_tot = np.sum((log_f - np.mean(log_f)) ** 2)
+    r_sq = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    if r_sq < 0.8: return 0.5
+    return float(np.clip(coeffs[0], 0.01, 0.99))
 
 
-def adf_test(spread):
-    """ADF тест стационарности."""
-    from statsmodels.tsa.stattools import adfuller
-    try:
-        result = adfuller(np.array(spread, dtype=float), autolag='AIC')
-        return result[1] < 0.05
-    except:
-        return False
+def calc_confidence(hurst, pvalue, stability_ratio=0.75):
+    checks = 0
+    if hurst < 0.40: checks += 1
+    if pvalue < 0.03: checks += 1
+    if stability_ratio >= 0.75: checks += 1
+    if checks >= 2: return 'HIGH'
+    if checks >= 1: return 'MEDIUM'
+    return 'LOW'
 
 
 # ═══════════════════════════════════════════════════════
-# TRADE & BACKTEST DATA STRUCTURES
+# BACKTESTER ENGINE
 # ═══════════════════════════════════════════════════════
 
-@dataclass
-class Trade:
-    """Одна сделка."""
-    entry_bar: int
-    entry_time: datetime
-    entry_z: float
-    entry_spread: float
-    entry_price1: float
-    entry_price2: float
-    entry_hr: float
-    entry_intercept: float  # v2: фиксируем intercept при входе
-    direction: str
-
-    exit_bar: int = 0
-    exit_time: datetime = None
-    exit_z: float = 0.0
-    exit_spread: float = 0.0
-    exit_price1: float = 0.0
-    exit_price2: float = 0.0
-    exit_reason: str = ''
-    pnl_pct: float = 0.0
-    bars_held: int = 0
-
-
-@dataclass
-class BacktestResult:
-    """Результаты бэктеста."""
-    trades: List[Trade]
-    equity_curve: np.ndarray
-    spread_series: np.ndarray
-    zscore_series: np.ndarray
-    hr_series: np.ndarray
-    price1: np.ndarray
-    price2: np.ndarray
-    timestamps: list
-
-    total_trades: int = 0
-    win_rate: float = 0.0
-    avg_pnl: float = 0.0
-    total_pnl: float = 0.0
-    max_drawdown: float = 0.0
-    sharpe: float = 0.0
-    profit_factor: float = 0.0
-    avg_bars_held: float = 0.0
-    max_bars_held: int = 0
-    warnings: list = field(default_factory=list)  # v3: pre-trade warnings
-
-
-# ═══════════════════════════════════════════════════════
-# BACKTESTING ENGINE v3.0
-# ═══════════════════════════════════════════════════════
-
-def run_backtest(
-    price1: np.ndarray,
-    price2: np.ndarray,
-    timestamps: list,
-    timeframe: str = '4h',
-    train_window: int = 200,
-    entry_z: float = 2.0,
-    exit_z: float = 0.3,          # v2: снижен с 0.5
-    stop_z: float = 4.5,
-    max_hold_bars: int = 100,
-    min_hold_bars: int = 3,       # v2: НЕ выходим раньше 3 баров
-    commission_pct: float = 0.1,
-    cooldown_bars: int = 1,       # v2: пропуск после закрытия
-    adaptive_entry: bool = True,  # v3: адаптивный entry_z из HL/качества пары
-    pre_filters: bool = True,     # v3: проверить Hurst/p-value/HL перед торговлей
-) -> BacktestResult:
+def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
+                 stop_z=4.0, max_bars=100, min_bars=3, commission_pct=0.1,
+                 adaptive_entry=True):
     """
-    Walk-forward бэктест v3.0.
-
-    ИЗМЕНЕНИЯ v3:
-      1. [CRITICAL] HL конвертируется из дней в часы (× 24)
-      2. [CRITICAL] Pre-trade фильтры: Hurst, p-value, HL range
-      3. Адаптивный cooldown = max(3, int(HL_bars * 0.75))
-      4. Адаптивный min_hold = max(min_hold_bars, int(HL_bars * 0.5))
+    Walk-forward backtest with Kalman HR + MAD Z-score.
+    
+    v4.0: 
+      - dt correct (hours_per_bar / 24)
+      - adaptive min_hold from HL
+      - adaptive entry_z from confidence
+      - cooldown after close
     """
-    n = len(price1)
-    assert len(price2) == n, "Price arrays must have same length"
-
-    hours_per_bar = {'1h': 1, '2h': 2, '4h': 4, '1d': 24, '15m': 0.25}.get(timeframe, 4)
-
-    # v3: Pre-trade quality assessment on initial window
-    warnings = []
-    if pre_filters and n > train_window:
-        init_kf = kalman_hedge_ratio(price1[:train_window], price2[:train_window])
-        if init_kf is not None:
-            init_spread = init_kf['spread']
-            # Hurst check
-            init_hurst, _ = calculate_hurst_exponent(init_spread, min_window=8)
-            if init_hurst >= 0.45:
-                warnings.append(f"⚠️ Hurst={init_hurst:.3f} ≥ 0.45 — нет mean reversion")
-            # Cointegration check
-            from statsmodels.tsa.stattools import coint
-            try:
-                _, pval, _ = coint(price1[:train_window], price2[:train_window])
-                if pval >= 0.05:
-                    warnings.append(f"⚠️ P-value={pval:.4f} ≥ 0.05 — нет коинтеграции")
-            except:
-                pass
-            # HL check
-            dt_init = {'1h': 1/24, '4h': 1/6, '1d': 1.0}.get(timeframe, 1/6)
-            ou_init = calculate_ou_parameters(init_spread, dt=dt_init)
-            if ou_init:
-                init_hl_hours = ou_init['halflife_ou'] * 24
-                init_hl_bars = init_hl_hours / hours_per_bar
-                if init_hl_bars < 1:
-                    warnings.append(f"⚠️ HL={init_hl_hours:.1f}ч ({init_hl_bars:.1f} баров) — слишком быстрый")
-                elif init_hl_bars > 50:
-                    warnings.append(f"⚠️ HL={init_hl_hours:.1f}ч ({init_hl_bars:.1f} баров) — слишком медленный")
-                # v3: Адаптивные параметры из HL
-                if adaptive_entry and 1 <= init_hl_bars <= 50:
-                    min_hold_bars = max(min_hold_bars, int(init_hl_bars * 0.5))
-                    cooldown_bars = max(cooldown_bars, int(init_hl_bars * 0.75))
-
-    # Storage
-    full_spread = np.full(n, np.nan)
-    full_zscore = np.full(n, np.nan)
-    full_hr = np.full(n, np.nan)
-    equity = np.ones(n)
-
-    trades: List[Trade] = []
-    current_trade: Optional[Trade] = None
-    cooldown_until = 0  # v2: не открывать до этого бара
-
-    for t in range(train_window, n):
-        # 1. Окно для Kalman + Z
-        w_start = max(0, t - train_window)
-        p1_window = price1[w_start:t + 1]
-        p2_window = price2[w_start:t + 1]
-
-        # 2. Kalman
-        kf = kalman_hedge_ratio(p1_window, p2_window, delta=1e-4)
-        if kf is None:
-            equity[t] = equity[t - 1]
-            continue
-
-        spread_window = kf['spread']
-        hr_current = kf['hr_final']
-        intercept_current = kf['intercept_final']
-
-        full_spread[t] = spread_window[-1]
-        full_hr[t] = hr_current
-
-        # 3. OU Half-life → adaptive Z window
-        dt_ou = {'1h': 1/24, '4h': 1/6, '1d': 1.0}.get(timeframe, 1/6)
-        ou = calculate_ou_parameters(spread_window, dt=dt_ou)
-        if ou and ou['halflife_ou'] < 999:
-            hl_hours = ou['halflife_ou'] * 24  # v3: CRITICAL FIX — halflife_ou в ДНЯХ, конвертируем в ЧАСЫ
-            hl_bars = hl_hours / hours_per_bar
-        else:
-            hl_bars = None
-
-        # 4. Z-score
-        zscores, z_win = calculate_adaptive_robust_zscore(
-            spread_window, halflife_bars=hl_bars
-        )
-
-        z_current = zscores[-1] if not np.isnan(zscores[-1]) else 0.0
-        full_zscore[t] = z_current
-
-        # ═══ TRADE LOGIC v2 ═══
-
-        if current_trade is not None:
-            bars_held = t - current_trade.entry_bar
-
-            # v2: Считаем Z на основе фиксированного Kalman (entry HR)
-            # Это предотвращает drift Z из-за обновления модели
-            fixed_spread_current = price1[t] - current_trade.entry_hr * price2[t] - current_trade.entry_intercept
-            
-            # Для fixed Z используем rolling медиану из spread window (текущего Kalman)
-            # но с фиксированным HR для текущего бара
-            z_for_exit = z_current  # основной Z (из walk-forward)
-
-            exit_signal = False
-            exit_reason = ''
-
-            # v2: Минимальное время удержания
-            if bars_held < min_hold_bars:
-                # Только стоп-лосс работает во время min_hold
-                if current_trade.direction == 'LONG' and z_for_exit < -stop_z:
-                    exit_signal = True
-                    exit_reason = 'STOP_LOSS'
-                elif current_trade.direction == 'SHORT' and z_for_exit > stop_z:
-                    exit_signal = True
-                    exit_reason = 'STOP_LOSS'
-            else:
-                if current_trade.direction == 'LONG':
-                    # LONG spread: вошли при Z < -entry_z, ждём возврат к 0
-                    if abs(z_for_exit) <= exit_z:
-                        exit_signal = True
-                        exit_reason = 'MEAN_REVERT'
-                    elif z_for_exit > 0 and z_for_exit > exit_z:
-                        # v2: OVERSHOOT — Z полностью перешёл на другую сторону
-                        # (вместо entry_z * 0.5, теперь: Z > 0 И |Z| > exit_z)
-                        exit_signal = True
-                        exit_reason = 'OVERSHOOT'
-                    elif z_for_exit < -stop_z:
-                        exit_signal = True
-                        exit_reason = 'STOP_LOSS'
-                    elif bars_held >= max_hold_bars:
-                        exit_signal = True
-                        exit_reason = 'TIMEOUT'
-                else:  # SHORT
-                    if abs(z_for_exit) <= exit_z:
-                        exit_signal = True
-                        exit_reason = 'MEAN_REVERT'
-                    elif z_for_exit < 0 and z_for_exit < -exit_z:
-                        # v2: OVERSHOOT для SHORT
-                        exit_signal = True
-                        exit_reason = 'OVERSHOOT'
-                    elif z_for_exit > stop_z:
-                        exit_signal = True
-                        exit_reason = 'STOP_LOSS'
-                    elif bars_held >= max_hold_bars:
-                        exit_signal = True
-                        exit_reason = 'TIMEOUT'
-
-            if exit_signal:
-                current_trade.exit_bar = t
-                current_trade.exit_time = timestamps[t]
-                current_trade.exit_z = z_for_exit
-                current_trade.exit_spread = spread_window[-1]
-                current_trade.exit_price1 = price1[t]
-                current_trade.exit_price2 = price2[t]
-                current_trade.exit_reason = exit_reason
-                current_trade.bars_held = bars_held
-
-                # P&L: dollar-neutral
-                r1 = (price1[t] - current_trade.entry_price1) / current_trade.entry_price1
-                r2 = (price2[t] - current_trade.entry_price2) / current_trade.entry_price2
-                hr = current_trade.entry_hr
-
-                if current_trade.direction == 'LONG':
-                    raw_pnl = r1 - hr * r2
-                else:
-                    raw_pnl = -r1 + hr * r2
-
-                # Нормируем на вложенный капитал
-                pnl_pct = raw_pnl / (1 + abs(hr)) * 100
-                # Комиссии (4 × = 2 ноги × open/close)
-                pnl_pct -= commission_pct * 4
-
-                current_trade.pnl_pct = pnl_pct
-                trades.append(current_trade)
-                current_trade = None
-                cooldown_until = t + cooldown_bars  # v2: cooldown
-
-        else:
-            # Нет позиции — проверяем вход
-            if t >= cooldown_until:  # v2: cooldown check
-                if abs(z_current) >= entry_z and abs(z_current) < stop_z:
-                    # v2: HR filter — не торгуем стейблкоин-пары и экстремальный HR
-                    if 0.01 <= abs(hr_current) <= 20.0 and hr_current > 0:
-                        direction = 'LONG' if z_current < 0 else 'SHORT'
-                        current_trade = Trade(
-                            entry_bar=t,
-                            entry_time=timestamps[t],
-                            entry_z=z_current,
-                            entry_spread=spread_window[-1],
-                            entry_price1=price1[t],
-                            entry_price2=price2[t],
-                            entry_hr=hr_current,
-                            entry_intercept=intercept_current,  # v2: фиксируем
-                            direction=direction,
-                        )
-
-        # Equity update
-        if current_trade is not None:
-            r1 = (price1[t] - current_trade.entry_price1) / current_trade.entry_price1
-            r2 = (price2[t] - current_trade.entry_price2) / current_trade.entry_price2
-            hr = current_trade.entry_hr
-            if current_trade.direction == 'LONG':
-                mtm = (r1 - hr * r2) / (1 + abs(hr))
-            else:
-                mtm = (-r1 + hr * r2) / (1 + abs(hr))
-            equity[t] = equity[current_trade.entry_bar - 1] * (1 + mtm)
-        else:
-            equity[t] = equity[t - 1]
-
-    # ═══ SUMMARY ═══
-    result = BacktestResult(
-        trades=trades,
-        equity_curve=equity,
-        spread_series=full_spread,
-        zscore_series=full_zscore,
-        hr_series=full_hr,
-        price1=price1,
-        price2=price2,
-        timestamps=timestamps,
-        warnings=warnings,  # v3: pre-trade warnings
-    )
-
-    if len(trades) > 0:
-        pnls = [t.pnl_pct for t in trades]
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p <= 0]
-
-        result.total_trades = len(trades)
-        result.win_rate = len(wins) / len(trades) * 100
-        result.avg_pnl = np.mean(pnls)
-        result.total_pnl = np.sum(pnls)
-        result.avg_bars_held = np.mean([t.bars_held for t in trades])
-        result.max_bars_held = max(t.bars_held for t in trades)
-
-        gross_profit = sum(wins) if wins else 0
-        gross_loss = abs(sum(losses)) if losses else 0.001
-        result.profit_factor = gross_profit / gross_loss
-
-        if len(pnls) > 1:
-            avg_hold = result.avg_bars_held * hours_per_bar
-            trades_per_year = 8760 / max(avg_hold, 1)
-            result.sharpe = (np.mean(pnls) / np.std(pnls)) * np.sqrt(min(trades_per_year, 365))
-
-        peak = equity[0]
-        max_dd = 0
-        for e in equity:
-            if e > peak:
-                peak = e
-            dd = (peak - e) / peak
-            if dd > max_dd:
-                max_dd = dd
-        result.max_drawdown = max_dd * 100
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════
-# DATA FETCHING
-# ═══════════════════════════════════════════════════════
-
-@st.cache_data(ttl=300)
-def fetch_ohlcv_cached(exchange_name, symbol, timeframe, lookback_days):
-    """Загрузка данных с кэшированием."""
-    exchange = getattr(ccxt, exchange_name)({'enableRateLimit': True})
-    exchange.load_markets()
-
-    bars_per_day = {'1h': 24, '4h': 6, '1d': 1, '2h': 12, '15m': 96}.get(timeframe, 6)
-    limit = lookback_days * bars_per_day
-
-    max_per_request = 300
-    all_data = []
-
-    if limit <= max_per_request:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        all_data = ohlcv
-    else:
-        tf_ms = {'1h': 3600000, '4h': 14400000, '1d': 86400000,
-                 '2h': 7200000, '15m': 900000}.get(timeframe, 14400000)
-        end_ts = exchange.milliseconds()
-        start_ts = end_ts - limit * tf_ms
-
-        current = start_ts
-        while current < end_ts:
-            try:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe,
-                                             since=int(current), limit=max_per_request)
-                if not ohlcv:
-                    break
-                all_data.extend(ohlcv)
-                current = ohlcv[-1][0] + tf_ms
-                time.sleep(0.15)
-            except Exception:
-                break
-
-    if not all_data:
-        return None
-
-    df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df = df.drop_duplicates(subset='timestamp').sort_values('timestamp')
-    df.set_index('timestamp', inplace=True)
-    return df
-
-
-def get_top_coins_cached(exchange_name, limit=100):
-    """Получить топ монет по объему."""
-    try:
-        exchange = getattr(ccxt, exchange_name)({'enableRateLimit': True})
-        exchange.load_markets()
-        tickers = exchange.fetch_tickers()
-
-        usdt_pairs = {k: v for k, v in tickers.items()
-                      if '/USDT' in k and ':' not in k}
-
-        valid = []
-        for sym, t in usdt_pairs.items():
-            try:
-                vol = float(t.get('quoteVolume', 0)) or float(t.get('volume', 0))
-                if vol > 0:
-                    valid.append((sym.replace('/USDT', ''), vol))
-            except:
-                continue
-
-        valid.sort(key=lambda x: -x[1])
-        return [c[0] for c in valid[:limit]]
-    except Exception as e:
-        st.error(f"Ошибка загрузки монет: {e}")
-        return ['BTC', 'ETH', 'SOL', 'XRP', 'BNB', 'ADA', 'AVAX', 'DOT',
-                'LINK', 'UNI', 'ATOM', 'LTC', 'NEAR', 'FIL', 'AAVE']
-
-
-# ═══════════════════════════════════════════════════════
-# PRE-ANALYSIS
-# ═══════════════════════════════════════════════════════
-
-# v2: Стейблкоины и wrapped — исключаем автоматически
-STABLECOIN_KEYWORDS = {'USDC', 'USDT', 'DAI', 'USDG', 'TUSD', 'BUSD', 'FRAX',
-                       'STETH', 'WBTC', 'WETH', 'WSTETH', 'XAUT', 'PAXG', 'MMT'}
-
-
-def analyze_pair_quality(p1, p2, timeframe='4h'):
-    """Быстрый анализ качества пары перед бэктестом."""
-    s1, s2 = np.array(p1, dtype=float), np.array(p2, dtype=float)
-    n = min(len(s1), len(s2))
-    s1, s2 = s1[:n], s2[:n]
-
-    pvalue = cointegration_test(s1, s2)
-
-    kf = kalman_hedge_ratio(s1, s2)
+    n = min(len(prices1), len(prices2))
+    p1, p2 = prices1[:n], prices2[:n]
+    
+    if n < 100:
+        return None, "Недостаточно данных (< 100 баров)"
+    
+    # Pre-trade statistics on full sample
+    _, pvalue, _ = coint(p1, p2)
+    
+    # Kalman
+    kf = kalman_hr(p1, p2)
     if kf is None:
-        return None
-
+        return None, "Kalman filter не сработал"
+    
     spread = kf['spread']
-    hr = kf['hr_final']
-    hr_std = kf['hr_std']
-
-    # v2: Единая Hurst DFA (из analysis v10.5)
-    hurst, hurst_fallback = calculate_hurst_exponent(spread, min_window=8)
-
-    adf_ok = adf_test(spread)
-
-    # v2: OU half-life (как в сканере)
-    dt = {'1h': 1/24, '4h': 1/6, '1d': 1}.get(timeframe, 1/6)
-    ou = calculate_ou_parameters(spread, dt=dt)
-    hl_hours = (ou['halflife_ou'] * 24) if ou else 999  # v3: CRITICAL FIX — конвертируем дни → часы
-
-    # Z-score
-    hours_per_bar = {'1h': 1, '4h': 4, '1d': 24}.get(timeframe, 4)
-    hl_bars = (hl_hours / hours_per_bar) if hl_hours < 999 else None
-    zscores, zw = calculate_adaptive_robust_zscore(spread, halflife_bars=hl_bars)
-    z_current = zscores[~np.isnan(zscores)][-1] if any(~np.isnan(zscores)) else 0
-
-    return {
-        'pvalue': pvalue,
-        'cointegrated': pvalue < 0.05,
-        'hedge_ratio': hr,
-        'hr_std': hr_std,
-        'hurst': hurst,
-        'hurst_fallback': hurst_fallback,
-        'adf_stationary': adf_ok,
-        'halflife_hours': hl_hours,
-        'z_current': z_current,
-        'z_window': zw,
-        'ou_theta': ou['theta'] if ou else 0,
-        'n_bars': n,
-        'spread': spread,
-        'hr_series': kf['hedge_ratios'],
-    }
-
-
-# ═══════════════════════════════════════════════════════
-# v2: УЛУЧШЕННАЯ ПАЛИТРА И ГРАФИКИ
-# ═══════════════════════════════════════════════════════
-
-# Цветовая палитра v2
-COLORS = {
-    'profit': '#00E676',        # ярко-зелёный
-    'loss': '#FF1744',          # ярко-красный
-    'breakeven': '#FFC107',     # жёлтый
-    'equity_line': '#00E5FF',   # циан
-    'equity_fill': 'rgba(0,229,255,0.08)',
-    'zscore_line': '#7C4DFF',   # фиолетовый
-    'spread_line': '#FF9100',   # оранжевый
-    'hr_line': '#E040FB',       # розовый
-    'entry_zone': 'rgba(255,193,7,0.15)',  # жёлтая зона входа
-    'stop_zone': 'rgba(255,23,68,0.08)',   # красная зона стопа
-    'mean_zone': 'rgba(0,230,118,0.10)',   # зелёная зона mean revert
-    'grid': 'rgba(255,255,255,0.06)',
-    'text_dim': 'rgba(255,255,255,0.5)',
-}
-
-
-def metric_color(value, good_thresh, bad_thresh, higher_is_better=True):
-    """Возвращает цвет метрики по порогам."""
-    if higher_is_better:
-        if value >= good_thresh:
-            return "good"
-        elif value <= bad_thresh:
-            return "‼️ bad"
-        return "ok"
+    hrs = kf['hrs']
+    
+    # dt correct (v4.0)
+    hpb = {'1h': 1, '4h': 4, '1d': 24}.get(timeframe, 4)
+    dt = hpb / 24.0  # в днях
+    
+    hl_days = calc_halflife(spread, dt=dt)
+    hl_hours = hl_days * 24
+    hl_bars = hl_hours / hpb if hl_hours < 999 else None
+    
+    hurst = calc_hurst(spread)
+    
+    # Confidence → adaptive thresholds
+    confidence = calc_confidence(hurst, pvalue)
+    
+    if adaptive_entry:
+        if confidence == 'HIGH':
+            entry_z = 1.5
+        elif confidence == 'MEDIUM':
+            entry_z = 2.0
+        else:
+            entry_z = 2.5
+    
+    # Adaptive min_hold from HL
+    if hl_bars and hl_bars < 50:
+        min_hold = max(min_bars, int(hl_bars * 0.5))
+        cooldown = max(5, int(hl_bars))
     else:
-        if value <= good_thresh:
-            return "good"
-        elif value >= bad_thresh:
-            return "‼️ bad"
-        return "ok"
-
-
-def plot_backtest_results(result: BacktestResult, coin1: str, coin2: str):
-    """v2: Plotly dashboard с улучшенной палитрой."""
-
-    fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        subplot_titles=[
-            'Equity Curve (капитал)',
-            'Z-Score спреда',
-            'Спред (Kalman)',
-            'Hedge Ratio',
-        ],
-        row_heights=[0.30, 0.30, 0.25, 0.15],
-    )
-
-    ts = result.timestamps
-
-    # 1. Equity — с цветной заливкой (зелёная если выше 1, красная если ниже)
-    eq = result.equity_curve
-    above_1 = np.where(eq >= 1.0, eq, 1.0)
-    below_1 = np.where(eq < 1.0, eq, 1.0)
-
-    fig.add_trace(go.Scatter(
-        x=ts, y=eq, name='Equity',
-        line=dict(color=COLORS['equity_line'], width=2.5),
-    ), row=1, col=1)
-
-    # Заливка: зелёная выше 1, красная ниже
-    fig.add_trace(go.Scatter(
-        x=ts, y=above_1, fill='tonexty',
-        fillcolor='rgba(0,230,118,0.12)', line=dict(width=0),
-        showlegend=False,
-    ), row=1, col=1)
-
-    fig.add_hline(y=1.0, line_dash='dash', line_color='white',
-                  opacity=0.3, row=1, col=1)
-
-    # 2. Z-score с зонами
-    z = result.zscore_series
-    fig.add_trace(go.Scatter(
-        x=ts, y=z, name='Z-Score',
-        line=dict(color=COLORS['zscore_line'], width=1.5),
-    ), row=2, col=1)
-
-    # Зоны: entry, stop, mean-revert
-    z_valid = z[~np.isnan(z)]
-    if len(z_valid) > 0:
-        z_range = max(abs(np.nanmin(z)), abs(np.nanmax(z)), 5)
-
-        # Mean-revert зона (зелёная, ±exit_z)
-        fig.add_hrect(y0=-0.3, y1=0.3, fillcolor=COLORS['mean_zone'],
-                      line_width=0, row=2, col=1)
-        # Entry зоны (жёлтые)
-        fig.add_hrect(y0=2.0, y1=3.0, fillcolor=COLORS['entry_zone'],
-                      line_width=0, row=2, col=1)
-        fig.add_hrect(y0=-3.0, y1=-2.0, fillcolor=COLORS['entry_zone'],
-                      line_width=0, row=2, col=1)
-        # Stop зоны (красные)
-        fig.add_hrect(y0=4.5, y1=z_range + 1, fillcolor=COLORS['stop_zone'],
-                      line_width=0, row=2, col=1)
-        fig.add_hrect(y0=-z_range - 1, y1=-4.5, fillcolor=COLORS['stop_zone'],
-                      line_width=0, row=2, col=1)
-
-    fig.add_hline(y=0, line_dash='solid', line_color='white',
-                  opacity=0.15, row=2, col=1)
-
-    # 3. Spread
-    fig.add_trace(go.Scatter(
-        x=ts, y=result.spread_series, name='Spread',
-        line=dict(color=COLORS['spread_line'], width=1.5),
-    ), row=3, col=1)
-
-    # 4. HR
-    fig.add_trace(go.Scatter(
-        x=ts, y=result.hr_series, name='Hedge Ratio',
-        line=dict(color=COLORS['hr_line'], width=1.5),
-    ), row=4, col=1)
-
-    # v2: Сделки — маркеры с чёткими цветами
-    for trade in result.trades:
-        if trade.pnl_pct > 0.5:
-            color = COLORS['profit']
-        elif trade.pnl_pct < -0.5:
-            color = COLORS['loss']
+        min_hold = min_bars
+        cooldown = 5
+    
+    # Z-score
+    zs, z_window = calc_zscore(spread, halflife_bars=hl_bars)
+    
+    # Pre-trade filter results
+    pre_trade = {
+        'pvalue': pvalue,
+        'hurst': hurst,
+        'hl_hours': hl_hours,
+        'hl_bars': hl_bars,
+        'hr': kf['hr'],
+        'confidence': confidence,
+        'entry_z_used': entry_z,
+        'min_hold': min_hold,
+        'cooldown': cooldown,
+        'z_window': z_window,
+    }
+    
+    filters_passed = True
+    filter_warnings = []
+    
+    if hurst >= 0.45:
+        filter_warnings.append(f"⚠️ Hurst={hurst:.3f} ≥ 0.45 — нет mean reversion")
+        filters_passed = False
+    
+    if pvalue >= 0.05:
+        filter_warnings.append(f"⚠️ P-value={pvalue:.4f} ≥ 0.05 — нет коинтеграции")
+    
+    if hl_bars is not None and (hl_bars < 1 or hl_bars > 50):
+        filter_warnings.append(f"⚠️ HL={hl_hours:.1f}ч ({hl_bars:.1f} баров) — вне торгуемого диапазона")
+    
+    if abs(kf['hr']) < 0.01 or abs(kf['hr']) > 30:
+        filter_warnings.append(f"⚠️ HR={kf['hr']:.4f} — экстремальный хедж")
+    
+    pre_trade['filter_warnings'] = filter_warnings
+    pre_trade['filters_passed'] = filters_passed
+    
+    # ═══════ TRADE SIMULATION ═══════
+    trades = []
+    position = None
+    last_close_bar = -cooldown - 1
+    commission_total = commission_pct * 4 / 100  # entry+exit × 2 sides
+    
+    equity = [1.0]
+    
+    warmup = max(z_window + 10, 50)
+    
+    for i in range(warmup, n):
+        z = zs[i]
+        if np.isnan(z):
+            equity.append(equity[-1])
+            continue
+        
+        # ═══ OPEN ═══
+        if position is None and (i - last_close_bar) > cooldown:
+            if z > entry_z:
+                position = {
+                    'entry_bar': i, 'direction': 'SHORT',
+                    'entry_z': z, 'entry_p1': p1[i], 'entry_p2': p2[i],
+                    'entry_hr': hrs[i],
+                }
+            elif z < -entry_z:
+                position = {
+                    'entry_bar': i, 'direction': 'LONG',
+                    'entry_z': z, 'entry_p1': p1[i], 'entry_p2': p2[i],
+                    'entry_hr': hrs[i],
+                }
+        
+        # ═══ CLOSE ═══
+        if position is not None:
+            bars_held = i - position['entry_bar']
+            hr_entry = position['entry_hr']
+            
+            # P&L
+            r1 = (p1[i] - position['entry_p1']) / position['entry_p1']
+            r2 = (p2[i] - position['entry_p2']) / position['entry_p2']
+            if position['direction'] == 'LONG':
+                raw_pnl = r1 - hr_entry * r2
+            else:
+                raw_pnl = -r1 + hr_entry * r2
+            pnl = raw_pnl / (1 + abs(hr_entry)) * 100
+            
+            exit_type = None
+            
+            if bars_held >= min_hold:
+                # Mean revert
+                if position['direction'] == 'LONG' and z >= -exit_z:
+                    exit_type = 'MEAN_REVERT'
+                elif position['direction'] == 'SHORT' and z <= exit_z:
+                    exit_type = 'MEAN_REVERT'
+                
+                # Overshoot
+                if position['direction'] == 'LONG' and z > 1.0:
+                    exit_type = 'OVERSHOOT'
+                elif position['direction'] == 'SHORT' and z < -1.0:
+                    exit_type = 'OVERSHOOT'
+            
+            # Stop loss (always active)
+            if position['direction'] == 'LONG' and z < -(stop_z):
+                exit_type = 'STOP_LOSS'
+            elif position['direction'] == 'SHORT' and z > stop_z:
+                exit_type = 'STOP_LOSS'
+            
+            # Max hold
+            if bars_held >= max_bars:
+                exit_type = 'MAX_HOLD'
+            
+            if exit_type:
+                pnl_after_comm = pnl - commission_total * 100
+                trades.append({
+                    'entry_bar': position['entry_bar'],
+                    'exit_bar': i,
+                    'direction': position['direction'],
+                    'entry_z': position['entry_z'],
+                    'exit_z': z,
+                    'bars_held': bars_held,
+                    'pnl_pct': round(pnl_after_comm, 3),
+                    'pnl_gross': round(pnl, 3),
+                    'exit_type': exit_type,
+                    'entry_hr': hr_entry,
+                })
+                equity.append(equity[-1] * (1 + pnl_after_comm / 100))
+                position = None
+                last_close_bar = i
+            else:
+                equity.append(equity[-1])
         else:
-            color = COLORS['breakeven']
-
-        # Entry marker
-        fig.add_trace(go.Scatter(
-            x=[trade.entry_time], y=[trade.entry_z],
-            mode='markers',
-            marker=dict(
-                symbol='triangle-up' if trade.direction == 'LONG' else 'triangle-down',
-                size=14, color=color,
-                line=dict(width=1.5, color='white')
-            ),
-            showlegend=False,
-            hovertext=(
-                f"<b>{trade.direction}</b> | Entry Z={trade.entry_z:.2f}<br>"
-                f"P&L: <b>{trade.pnl_pct:+.2f}%</b> | {trade.exit_reason}<br>"
-                f"Bars: {trade.bars_held} | HR: {trade.entry_hr:.4f}"
-            ),
-            hoverinfo='text',
-        ), row=2, col=1)
-
-        # Exit marker
-        fig.add_trace(go.Scatter(
-            x=[trade.exit_time], y=[trade.exit_z],
-            mode='markers',
-            marker=dict(symbol='x', size=11, color=color,
-                       line=dict(width=2.5, color=color)),
-            showlegend=False,
-        ), row=2, col=1)
-
-        # Закрашенная зона сделки
-        fig.add_vrect(
-            x0=trade.entry_time, x1=trade.exit_time,
-            fillcolor=color, opacity=0.05, line_width=0,
-            row=2, col=1,
-        )
-
-    fig.update_layout(
-        height=950,
-        template='plotly_dark',
-        title=dict(
-            text=f'Backtest: {coin1}/{coin2}',
-            font=dict(size=18)
-        ),
-        showlegend=False,
-        margin=dict(l=60, r=30, t=50, b=30),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(17,17,17,1)',
-    )
-
-    for row in range(1, 5):
-        fig.update_yaxes(gridcolor=COLORS['grid'], row=row, col=1)
-        fig.update_xaxes(gridcolor=COLORS['grid'], row=row, col=1)
-
-    fig.update_yaxes(title_text='Equity', row=1, col=1)
-    fig.update_yaxes(title_text='Z-Score', row=2, col=1)
-    fig.update_yaxes(title_text='Spread', row=3, col=1)
-    fig.update_yaxes(title_text='HR', row=4, col=1)
-
-    return fig
-
-
-def plot_trade_distribution(trades: List[Trade]):
-    """v2: Распределение P&L с улучшенной палитрой."""
+            equity.append(equity[-1])
+    
+    # Close remaining position
+    if position is not None:
+        i = n - 1
+        hr_entry = position['entry_hr']
+        r1 = (p1[i] - position['entry_p1']) / position['entry_p1']
+        r2 = (p2[i] - position['entry_p2']) / position['entry_p2']
+        if position['direction'] == 'LONG':
+            raw_pnl = r1 - hr_entry * r2
+        else:
+            raw_pnl = -r1 + hr_entry * r2
+        pnl = raw_pnl / (1 + abs(hr_entry)) * 100 - commission_total * 100
+        trades.append({
+            'entry_bar': position['entry_bar'], 'exit_bar': i,
+            'direction': position['direction'],
+            'entry_z': position['entry_z'], 'exit_z': float(zs[i]) if not np.isnan(zs[i]) else 0,
+            'bars_held': i - position['entry_bar'],
+            'pnl_pct': round(pnl, 3), 'pnl_gross': round(pnl + commission_total * 100, 3),
+            'exit_type': 'END_OF_DATA', 'entry_hr': hr_entry,
+        })
+        equity.append(equity[-1] * (1 + pnl / 100))
+    
+    # ═══════ STATISTICS ═══════
     if not trades:
-        return None
-
-    pnls = [t.pnl_pct for t in trades]
-
-    # v2: 3-цветная шкала
-    colors = []
-    for p in pnls:
-        if p > 0.5:
-            colors.append(COLORS['profit'])
-        elif p < -0.5:
-            colors.append(COLORS['loss'])
-        else:
-            colors.append(COLORS['breakeven'])
-
-    fig = make_subplots(rows=1, cols=2,
-                        subplot_titles=['P&L по сделкам', 'Распределение P&L'])
-
-    # Bar chart
-    fig.add_trace(go.Bar(
-        x=list(range(1, len(pnls) + 1)),
-        y=pnls,
-        marker_color=colors,
-        name='P&L %',
-    ), row=1, col=1)
-
-    fig.add_hline(y=0, line_dash='dash', line_color='white',
-                  opacity=0.3, row=1, col=1)
-
-    # Histogram с двумя цветами
+        return {'trades': [], 'stats': None, 'pre_trade': pre_trade, 
+                'equity': equity, 'zscore': zs, 'spread': spread}, "Нет сделок"
+    
+    pnls = [t['pnl_pct'] for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
-
-    if losses:
-        fig.add_trace(go.Histogram(
-            x=losses, nbinsx=15,
-            marker_color=COLORS['loss'],
-            opacity=0.7,
-            name='Losses',
-        ), row=1, col=2)
-    if wins:
-        fig.add_trace(go.Histogram(
-            x=wins, nbinsx=15,
-            marker_color=COLORS['profit'],
-            opacity=0.7,
-            name='Wins',
-        ), row=1, col=2)
-
-    fig.add_vline(x=0, line_dash='dash', line_color='white',
-                  opacity=0.5, row=1, col=2)
-
-    fig.update_layout(
-        height=350, template='plotly_dark',
-        showlegend=False,
-        margin=dict(l=50, r=30, t=40, b=30),
-        barmode='overlay',
-        plot_bgcolor='rgba(0,0,0,0)',
-    )
-
-    return fig
-
-
-# ═══════════════════════════════════════════════════════
-# MULTI-PAIR SCANNER BACKTEST
-# ═══════════════════════════════════════════════════════
-
-def scan_and_backtest(exchange_name, coins, timeframe, lookback_days,
-                      entry_z, exit_z, stop_z, max_hold, min_hold,
-                      commission, progress_bar):
-    """Автоматический скан + бэктест всех пар (v2)."""
-    from statsmodels.tsa.stattools import coint
-
-    progress_bar.progress(0.05, "Загрузка данных...")
-    price_data = {}
-    for i, coin in enumerate(coins):
-        # v2: Фильтр стейблкоинов при загрузке
-        if coin.upper() in STABLECOIN_KEYWORDS:
-            continue
-        symbol = f"{coin}/USDT"
-        try:
-            df = fetch_ohlcv_cached(exchange_name, symbol, timeframe, lookback_days)
-            if df is not None and len(df) > 50:
-                price_data[coin] = df['close']
-        except:
-            pass
-        progress_bar.progress(0.05 + 0.25 * (i + 1) / len(coins),
-                            f"Загружено {len(price_data)}/{i+1} монет...")
-        time.sleep(0.05)
-
-    if len(price_data) < 2:
-        st.error("Недостаточно данных")
-        return []
-
-    progress_bar.progress(0.35, "Тест коинтеграции...")
-    coin_list = list(price_data.keys())
-    pairs_with_pvalue = []
-
-    total_pairs = len(coin_list) * (len(coin_list) - 1) // 2
-    idx = 0
-    for i in range(len(coin_list)):
-        for j in range(i + 1, len(coin_list)):
-            idx += 1
-            c1, c2 = coin_list[i], coin_list[j]
-            s1 = price_data[c1].dropna()
-            s2 = price_data[c2].dropna()
-            common = s1.index.intersection(s2.index)
-            if len(common) < 50:
-                continue
-
-            pval = cointegration_test(s1[common].values, s2[common].values)
-            if pval < 0.10:
-                pairs_with_pvalue.append((c1, c2, pval))
-
-            if idx % 100 == 0:
-                progress_bar.progress(
-                    0.35 + 0.25 * idx / total_pairs,
-                    f"Коинтеграция: {idx}/{total_pairs}"
-                )
-
-    pairs_with_pvalue.sort(key=lambda x: x[2])
-    top_pairs = pairs_with_pvalue[:30]
-
-    if not top_pairs:
-        st.warning("Коинтегрированных пар не найдено")
-        return []
-
-    st.info(f"📊 Найдено {len(pairs_with_pvalue)} коинтегрированных пар, тестируем топ-{len(top_pairs)}")
-
-    all_results = []
-
-    for k, (c1, c2, pval) in enumerate(top_pairs):
-        progress_bar.progress(
-            0.65 + 0.35 * (k + 1) / len(top_pairs),
-            f"Бэктест {c1}/{c2} ({k+1}/{len(top_pairs)})..."
-        )
-
-        s1 = price_data[c1].dropna()
-        s2 = price_data[c2].dropna()
-        common = s1.index.intersection(s2.index)
-        p1 = s1[common].values
-        p2 = s2[common].values
-        ts_list = list(common)
-
-        if len(p1) < 100:
-            continue
-
-        train_w = max(50, int(len(p1) * 0.5))  # v2: 50% (было 60%)
-
-        qual = analyze_pair_quality(p1, p2, timeframe)
-        if qual is None:
-            continue
-        if qual['hurst'] > 0.50:  # v2: строже (было 0.55)
-            continue
-        # v2: HR filter
-        if abs(qual['hedge_ratio']) > 20 or abs(qual['hedge_ratio']) < 0.01:
-            continue
-        if qual['hedge_ratio'] <= 0:
-            continue
-
-        bt = run_backtest(
-            p1, p2, ts_list,
-            timeframe=timeframe,
-            train_window=train_w,
-            entry_z=entry_z,
-            exit_z=exit_z,
-            stop_z=stop_z,
-            max_hold_bars=max_hold,
-            min_hold_bars=min_hold,
-            commission_pct=commission,
-        )
-
-        if bt.total_trades >= 1:
-            all_results.append({
-                'coin1': c1, 'coin2': c2,
-                'pvalue': pval,
-                'hurst': qual['hurst'],
-                'halflife_h': qual['halflife_hours'],
-                'hr': qual['hedge_ratio'],
-                'result': bt,
-            })
-
-    return all_results
+    
+    total_pnl = sum(pnls)
+    win_rate = len(wins) / len(pnls) * 100 if pnls else 0
+    avg_pnl = np.mean(pnls)
+    
+    # Max drawdown
+    peak = equity[0]
+    max_dd = 0
+    for e in equity:
+        if e > peak: peak = e
+        dd = (peak - e) / peak * 100
+        if dd > max_dd: max_dd = dd
+    
+    # Sharpe
+    if len(pnls) > 1 and np.std(pnls) > 0:
+        sharpe = np.mean(pnls) / np.std(pnls) * np.sqrt(len(pnls))
+    else:
+        sharpe = 0
+    
+    # Profit Factor
+    gross_win = sum(wins) if wins else 0
+    gross_loss = abs(sum(losses)) if losses else 0.001
+    pf = gross_win / gross_loss
+    
+    avg_hold = np.mean([t['bars_held'] for t in trades])
+    max_hold_actual = max(t['bars_held'] for t in trades)
+    
+    # By exit type
+    exit_types = {}
+    for t in trades:
+        et = t['exit_type']
+        if et not in exit_types:
+            exit_types[et] = {'count': 0, 'pnl_sum': 0, 'pnls': []}
+        exit_types[et]['count'] += 1
+        exit_types[et]['pnl_sum'] += t['pnl_pct']
+        exit_types[et]['pnls'].append(t['pnl_pct'])
+    
+    for et in exit_types:
+        exit_types[et]['avg_pnl'] = np.mean(exit_types[et]['pnls'])
+        exit_types[et]['win_rate'] = sum(1 for p in exit_types[et]['pnls'] if p > 0) / len(exit_types[et]['pnls']) * 100
+    
+    stats = {
+        'n_trades': len(trades),
+        'win_rate': win_rate,
+        'total_pnl': total_pnl,
+        'avg_pnl': avg_pnl,
+        'max_dd': max_dd,
+        'sharpe': sharpe,
+        'profit_factor': pf,
+        'avg_hold': avg_hold,
+        'max_hold': max_hold_actual,
+        'exit_types': exit_types,
+    }
+    
+    return {'trades': trades, 'stats': stats, 'pre_trade': pre_trade,
+            'equity': equity, 'zscore': zs, 'spread': spread}, None
 
 
 # ═══════════════════════════════════════════════════════
 # STREAMLIT UI
 # ═══════════════════════════════════════════════════════
 
-st.set_page_config(
-    page_title="Pairs Backtester v2",
-    page_icon="📊",
-    layout="wide"
-)
-
-st.markdown("""
-<style>
-    .stMetric [data-testid="stMetricValue"] {
-        font-size: 1.8rem !important;
-        font-weight: bold !important;
-    }
-    /* v2: Color-coded metric deltas */
-    .stMetric [data-testid="stMetricDelta"][style*="color: rgb(255"] {
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
-
+st.set_page_config(page_title="Pairs Backtester", page_icon="📊", layout="wide")
 st.title("📊 Pairs Trading Backtester")
-st.caption("v3.0 | Kalman HR + MAD Z-Score + Walk-Forward + Pre-Trade Filters + HL Fix")
+st.caption("v4.0 | Kalman HR + MAD Z-Score + Walk-Forward + Pre-Trade Filters + HL Fix + Adaptive entry_z")
 
-# ═══ SIDEBAR ═══
+# Sidebar
 with st.sidebar:
     st.header("⚙️ Настройки")
-
-    mode = st.radio("Режим", ["🎯 Одна пара", "🔍 Автоскан"], index=0)
-
-    st.subheader("Данные")
-    exchange = st.selectbox("Биржа", ['okx', 'bybit', 'binance'], index=0)
-    timeframe = st.selectbox("Таймфрейм", ['1h', '4h', '1d'], index=1)
-    lookback = st.slider("Период (дней)", 30, 365, 139)
-
-    st.subheader("Параметры стратегии")
-    entry_z = st.slider("Z для входа", 1.5, 4.0, 2.3, 0.1,
-                        help="Порог |Z| для открытия позиции. Выше = меньше сделок, но больше прибыль на сделку.")
-    exit_z = st.slider("Z для выхода", 0.0, 1.0, 0.3, 0.1,
-                       help="Спред вернулся к mean когда |Z| < этого значения. Ниже = больше прибыль, но дольше ждать.")
-    stop_z = st.slider("Z для стопа", 3.0, 7.0, 4.5, 0.5,
-                       help="Стоп-лосс если |Z| превышает")
-    max_hold = st.slider("Макс. баров в сделке", 20, 300, 100, 10)
-    # v2: Новые параметры
-    min_hold = st.slider("Мин. баров в сделке", 0, 10, 3, 1,
-                         help="Не выходить раньше N баров (кроме стопа). 3 = 12ч на 4h.")
-    commission = st.slider("Комиссия (%)", 0.0, 0.5, 0.1, 0.01,
-                          help="Комиссия за сделку (одна нога). Итого 4× за round-trip.")
-
+    
+    mode = st.radio("Режим", ["🔍 Одна пара", "🔄 Автоскан"])
+    
     st.divider()
-    st.caption(f"💰 Комиссия за сделку: **{commission * 4:.2f}%** (4 × {commission}%)")
-    if min_hold > 0:
-        hours = min_hold * {'1h': 1, '4h': 4, '1d': 24}.get(timeframe, 4)
-        st.caption(f"⏱️ Мин. удержание: **{hours}ч** ({min_hold} баров)")
+    st.subheader("Данные")
+    
+    exchange_name = st.selectbox("Биржа", ['okx', 'kucoin', 'bybit', 'binance'], index=0,
+                                 help="⚠️ Binance/Bybit заблокированы на облачных серверах")
+    timeframe = st.selectbox("Таймфрейм", ['1h', '4h', '1d'], index=1)
+    lookback_days = st.slider("Период (дней)", 30, 365, 139, step=7)
+    
+    if mode == "🔄 Автоскан":
+        n_coins = st.slider("Количество монет", 20, 100, 50, step=10)
+        max_pairs_bt = st.slider("Макс. пар для бэктеста", 5, 50, 20)
+    
+    st.divider()
+    st.subheader("Параметры стратегии")
+    
+    adaptive_entry = st.checkbox("Адаптивный entry_z (от Confidence)", value=True,
+                                 help="HIGH→1.5, MEDIUM→2.0, LOW→2.5")
+    
+    if not adaptive_entry:
+        entry_z = st.slider("Z для входа", 1.0, 4.0, 2.30, step=0.1)
+    else:
+        entry_z = 2.0  # будет перезаписан
+        st.info("HIGH→1.5, MEDIUM→2.0, LOW→2.5")
+    
+    exit_z = st.slider("Z для выхода", 0.0, 1.5, 0.30, step=0.1)
+    stop_z = st.slider("Z для стопа", 2.0, 6.0, 4.50, step=0.5)
+    max_bars = st.slider("Макс. баров в сделке", 20, 200, 100)
+    min_bars = st.slider("Мин. баров в сделке", 1, 20, 3)
+    commission = st.slider("Комиссия (%)", 0.0, 0.3, 0.10, step=0.01)
+    
+    st.caption(f"💸 Комиссия за сделку: {commission * 4:.2f}% (4 × {commission:.2f}%)")
+    st.caption(f"📏 Макс. удержание: {max_bars} баров ({max_bars * {'1h':1,'4h':4,'1d':24}[timeframe]}ч)")
 
-# ═══ MAIN ═══
 
-if mode == "🎯 Одна пара":
-    st.subheader("Бэктест одной пары")
+# ═══════════════════════════════════════════════════════
+# SINGLE PAIR MODE
+# ═══════════════════════════════════════════════════════
 
+if mode == "🔍 Одна пара":
     col1, col2, col3 = st.columns([2, 2, 1])
+    
     with col1:
-        coin1 = st.text_input("Монета 1", value="FIL",
-                              help="Тикер без /USDT").upper().strip()
+        coin1 = st.text_input("🪙 Монета 1", "FIL").upper().strip()
     with col2:
-        coin2 = st.text_input("Монета 2", value="CRV",
-                              help="Тикер без /USDT").upper().strip()
+        coin2 = st.text_input("🪙 Монета 2", "CRV").upper().strip()
     with col3:
-        st.write("")
-        st.write("")
         run_btn = st.button("🚀 Запустить", type="primary", use_container_width=True)
-
+    
     if run_btn and coin1 and coin2:
-        progress = st.progress(0, "Загрузка данных...")
-
-        try:
-            progress.progress(0.1, f"Загружаю {coin1}/USDT...")
-            df1 = fetch_ohlcv_cached(exchange, f"{coin1}/USDT", timeframe, lookback)
-            progress.progress(0.3, f"Загружаю {coin2}/USDT...")
-            df2 = fetch_ohlcv_cached(exchange, f"{coin2}/USDT", timeframe, lookback)
-
-            if df1 is None or df2 is None:
-                st.error("❌ Не удалось загрузить данные. Проверьте тикеры.")
+        with st.spinner(f"Загружаю данные {coin1}/{coin2}..."):
+            ex, actual_exchange = get_exchange(exchange_name)
+            if ex is None:
+                st.error("❌ Все биржи недоступны")
                 st.stop()
-
-            common = df1.index.intersection(df2.index)
-            if len(common) < 50:
-                st.error(f"❌ Слишком мало общих баров: {len(common)}")
+            
+            hpb_map = {'1h': 24, '4h': 6, '1d': 1}
+            limit = lookback_days * hpb_map.get(timeframe, 6)
+            
+            try:
+                ohlcv1 = ex.fetch_ohlcv(f"{coin1}/USDT", timeframe, limit=limit)
+                ohlcv2 = ex.fetch_ohlcv(f"{coin2}/USDT", timeframe, limit=limit)
+                
+                df1 = pd.DataFrame(ohlcv1, columns=['ts','o','h','l','c','v'])
+                df2 = pd.DataFrame(ohlcv2, columns=['ts','o','h','l','c','v'])
+                df1['ts'] = pd.to_datetime(df1['ts'], unit='ms')
+                df2['ts'] = pd.to_datetime(df2['ts'], unit='ms')
+                
+                merged = pd.merge(df1[['ts','c']], df2[['ts','c']], on='ts', suffixes=('_1','_2'))
+                
+                st.info(f"📊 Загружено {len(merged)} баров ({timeframe}) с {merged['ts'].iloc[0].date()} по {merged['ts'].iloc[-1].date()}")
+                
+                p1 = merged['c_1'].values
+                p2 = merged['c_2'].values
+                
+            except Exception as e:
+                st.error(f"❌ Ошибка загрузки: {e}")
                 st.stop()
-
-            p1 = df1.loc[common, 'close'].values
-            p2 = df2.loc[common, 'close'].values
-            timestamps = list(common)
-
-            st.info(f"📊 Загружено {len(common)} баров ({timeframe}) с {common[0].strftime('%Y-%m-%d')} по {common[-1].strftime('%Y-%m-%d')}")
-
-            # Анализ качества
-            progress.progress(0.5, "Анализ качества пары...")
-            qual = analyze_pair_quality(p1, p2, timeframe)
-
-            if qual:
-                qcol1, qcol2, qcol3, qcol4, qcol5, qcol6 = st.columns(6)
-                qcol1.metric("P-value", f"{qual['pvalue']:.4f}",
-                            delta="✅ Coint" if qual['cointegrated'] else "❌ No coint")
-                qcol2.metric("Hurst", f"{qual['hurst']:.3f}",
-                            delta="✅ MR" if qual['hurst'] < 0.45 else ("⚠️ Weak" if qual['hurst'] < 0.5 else "❌ Trend"))
-                qcol3.metric("Half-life", f"{qual['halflife_hours']:.1f}ч",
-                            delta="✅ Fast" if qual['halflife_hours'] < 24 else ("⚠️ Slow" if qual['halflife_hours'] < 48 else "❌ Too slow"))
-                qcol4.metric("HR", f"{qual['hedge_ratio']:.4f}",
-                            delta="✅ Good" if 0.1 <= abs(qual['hedge_ratio']) <= 5 else "⚠️ Extreme")
-                qcol5.metric("ADF", "✅" if qual['adf_stationary'] else "❌")
-                qcol6.metric("Z сейчас", f"{qual['z_current']:.2f}")
-
-            # Бэктест
-            progress.progress(0.6, "Walk-forward бэктест...")
-            train_w = max(50, int(len(p1) * 0.4))
-
-            result = run_backtest(
-                p1, p2, timestamps,
-                timeframe=timeframe,
-                train_window=train_w,
-                entry_z=entry_z,
-                exit_z=exit_z,
-                stop_z=stop_z,
-                max_hold_bars=max_hold,
-                min_hold_bars=min_hold,
-                commission_pct=commission,
+        
+        # Run backtest
+        with st.spinner("Запускаю бэктест..."):
+            result, error = run_backtest(
+                p1, p2, timeframe=timeframe,
+                entry_z=entry_z, exit_z=exit_z, stop_z=stop_z,
+                max_bars=max_bars, min_bars=min_bars,
+                commission_pct=commission, adaptive_entry=adaptive_entry
             )
-
-            progress.progress(1.0, "Готово!")
-            time.sleep(0.3)
-            progress.empty()
-
-            # ═══ РЕЗУЛЬТАТЫ ═══
+        
+        if error and result is None:
+            st.error(f"❌ {error}")
+            st.stop()
+        
+        pt = result['pre_trade']
+        
+        # Pre-trade metrics
+        st.divider()
+        mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+        
+        pv = pt['pvalue']
+        mc1.metric("P-value", f"{pv:.4f}", 
+                   "✅ Coint" if pv < 0.05 else "❌ No coint")
+        mc2.metric("Hurst", f"{pt['hurst']:.3f}",
+                   "✅ MR" if pt['hurst'] < 0.45 else "❌ Trend")
+        mc3.metric("Half-life", f"{pt['hl_hours']:.1f}ч",
+                   "⚡ Fast" if pt['hl_hours'] < 20 else "✅ OK" if pt['hl_hours'] < 50 else "❌")
+        mc4.metric("HR", f"{pt['hr']:.4f}")
+        mc5.metric("Confidence", pt['confidence'])
+        mc6.metric("Entry Z", f"±{pt['entry_z_used']:.1f}",
+                   f"adaptive" if adaptive_entry else "fixed")
+        
+        # Pre-trade warnings
+        for w in pt.get('filter_warnings', []):
+            st.warning(w)
+        
+        st.divider()
+        
+        # Results
+        if result['stats'] is None:
+            st.warning(error or "Нет сделок")
+        else:
+            st.subheader("📊 Результаты бэктеста")
+            
+            stats = result['stats']
+            
+            rc1, rc2, rc3, rc4, rc5, rc6 = st.columns(6)
+            rc1.metric("Сделок", stats['n_trades'])
+            
+            wr = stats['win_rate']
+            rc2.metric("Win Rate", f"{wr:.1f}%",
+                       "✅ ok" if wr >= 45 else "❌ loss")
+            
+            tp = stats['total_pnl']
+            rc3.metric("Total P&L", f"{tp:+.2f}%",
+                       "✅" if tp > 0 else "❌ loss")
+            
+            ap = stats['avg_pnl']
+            rc4.metric("Avg P&L", f"{ap:+.2f}%",
+                       "✅" if ap > 0 else "❌")
+            
+            md = stats['max_dd']
+            rc5.metric("Max DD", f"{md:.1f}%",
+                       "✅ ok" if md < 15 else "⚠️")
+            
+            pf = stats['profit_factor']
+            rc6.metric("Profit Factor", f"{pf:.2f}",
+                       "✅ good" if pf > 1.0 else "❌ bad")
+            
+            # Additional metrics
+            rc7, rc8, rc9, rc10 = st.columns(4)
+            rc7.metric("Sharpe", f"{stats['sharpe']:.2f}",
+                       "✅" if stats['sharpe'] > 1 else "⚠️")
+            rc8.metric("Avg Hold", f"{stats['avg_hold']:.0f} баров")
+            rc9.metric("Max Hold", f"{stats['max_hold']} баров")
+            rc10.metric("Min Hold (adaptive)", f"{pt['min_hold']} баров",
+                        f"CD: {pt['cooldown']} баров")
+            
+            # Exit type breakdown
             st.divider()
-            st.subheader("📈 Результаты бэктеста")
+            st.subheader("📋 По типам выхода")
+            
+            et_rows = []
+            for et, ed in stats['exit_types'].items():
+                et_rows.append({
+                    'Тип': et,
+                    'Сделок': ed['count'],
+                    'Win%': f"{ed['win_rate']:.0f}%",
+                    'Avg P&L': f"{ed['avg_pnl']:+.2f}%",
+                    'Total': f"{ed['pnl_sum']:+.2f}%",
+                })
+            st.dataframe(pd.DataFrame(et_rows), use_container_width=True, hide_index=True)
+            
+            # Equity curve
+            st.divider()
+            st.subheader("📈 Equity Curve")
+            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                               vertical_spacing=0.08,
+                               subplot_titles=['Equity Curve (капитализация)', 'Z-Score + сделки'],
+                               row_heights=[0.5, 0.5])
+            
+            fig.add_trace(go.Scatter(
+                y=result['equity'], name='Equity',
+                line=dict(color='#4fc3f7', width=2)
+            ), row=1, col=1)
+            fig.add_hline(y=1.0, line_dash='dash', line_color='gray', row=1, col=1)
+            
+            # Z-score with trade markers
+            fig.add_trace(go.Scatter(
+                y=result['zscore'], name='Z-Score',
+                line=dict(color='#ffa726', width=1)
+            ), row=2, col=1)
+            fig.add_hline(y=0, line_dash='dash', line_color='gray', row=2, col=1)
+            fig.add_hline(y=pt['entry_z_used'], line_dash='dot', line_color='red', row=2, col=1)
+            fig.add_hline(y=-pt['entry_z_used'], line_dash='dot', line_color='green', row=2, col=1)
+            
+            # Trade markers
+            for t in result['trades']:
+                color = 'green' if t['pnl_pct'] > 0 else 'red'
+                fig.add_trace(go.Scatter(
+                    x=[t['entry_bar']], y=[t['entry_z']],
+                    mode='markers', marker=dict(size=8, color=color, symbol='triangle-up' if t['direction'] == 'LONG' else 'triangle-down'),
+                    showlegend=False
+                ), row=2, col=1)
+            
+            fig.update_layout(height=500, template='plotly_dark', showlegend=False,
+                             margin=dict(l=50, r=30, t=40, b=30))
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Trade list
+            st.divider()
+            st.subheader("📋 Список сделок")
+            
+            trade_rows = [{
+                '#': i+1,
+                'Dir': t['direction'],
+                'Entry Z': f"{t['entry_z']:+.2f}",
+                'Exit Z': f"{t['exit_z']:+.2f}",
+                'Bars': t['bars_held'],
+                'P&L %': f"{t['pnl_pct']:+.2f}",
+                'Тип': t['exit_type'],
+                'HR': f"{t['entry_hr']:.4f}",
+            } for i, t in enumerate(result['trades'])]
+            
+            st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
+            
+            # CSV Export
+            df_export = pd.DataFrame(trade_rows)
+            csv_data = df_export.to_csv(index=False)
+            st.download_button("📥 Скачать сделки (CSV)", csv_data,
+                             f"backtest_{coin1}_{coin2}_{timeframe}_{datetime.now().strftime('%Y%m%d')}.csv",
+                             "text/csv")
 
-            # v3: Pre-trade warnings
-            if hasattr(result, 'warnings') and result.warnings:
-                for w in result.warnings:
-                    st.warning(w)
 
-            if result.total_trades == 0:
-                st.warning("⚠️ Ни одной сделки за период. Попробуйте снизить Z для входа или увеличить период.")
-            else:
-                # v2: KPI с цветовой индикацией
-                m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Сделок", result.total_trades)
-                m2.metric("Win Rate", f"{result.win_rate:.1f}%",
-                         delta=metric_color(result.win_rate, 55, 40))
-                m3.metric("Total P&L", f"{result.total_pnl:+.2f}%",
-                         delta="✅ profit" if result.total_pnl > 0 else "❌ loss")
-                m4.metric("Avg P&L", f"{result.avg_pnl:+.2f}%",
-                         delta="✅" if result.avg_pnl > 0 else "❌")
-                m5.metric("Max DD", f"{result.max_drawdown:.1f}%",
-                         delta=metric_color(result.max_drawdown, 15, 30, higher_is_better=False))
-                m6.metric("Profit Factor", f"{result.profit_factor:.2f}",
-                         delta=metric_color(result.profit_factor, 1.5, 1.0))
+# ═══════════════════════════════════════════════════════
+# AUTO-SCAN MODE
+# ═══════════════════════════════════════════════════════
 
-                m7, m8, m9 = st.columns(3)
-                m7.metric("Sharpe", f"{result.sharpe:.2f}",
-                         delta=metric_color(result.sharpe, 1.0, 0, ))
-                m8.metric("Avg Hold", f"{result.avg_bars_held:.0f} баров")
-                m9.metric("Max Hold", f"{result.max_bars_held} баров")
-
-                # Графики
-                fig_main = plot_backtest_results(result, coin1, coin2)
-                st.plotly_chart(fig_main, use_container_width=True)
-
-                fig_dist = plot_trade_distribution(result.trades)
-                if fig_dist:
-                    st.plotly_chart(fig_dist, use_container_width=True)
-
-                # Таблица сделок
-                st.subheader("📋 Журнал сделок")
-                trades_data = []
-                for i, t in enumerate(result.trades, 1):
-                    trades_data.append({
-                        '#': i,
-                        'Вход': t.entry_time.strftime('%Y-%m-%d %H:%M') if hasattr(t.entry_time, 'strftime') else str(t.entry_time),
-                        'Выход': t.exit_time.strftime('%Y-%m-%d %H:%M') if t.exit_time and hasattr(t.exit_time, 'strftime') else str(t.exit_time),
-                        'Dir': t.direction,
-                        'Entry Z': f"{t.entry_z:.2f}",
-                        'Exit Z': f"{t.exit_z:.2f}",
-                        'HR': f"{t.entry_hr:.4f}",
-                        'Bars': t.bars_held,
-                        'P&L %': f"{t.pnl_pct:+.2f}",
-                        'Причина': t.exit_reason,
-                    })
-
-                df_trades = pd.DataFrame(trades_data)
-                st.dataframe(df_trades, use_container_width=True, hide_index=True)
-
-                # Exit reasons breakdown
-                if result.trades:
-                    reasons = {}
-                    for t in result.trades:
-                        r = t.exit_reason
-                        if r not in reasons:
-                            reasons[r] = {'count': 0, 'pnl': 0}
-                        reasons[r]['count'] += 1
-                        reasons[r]['pnl'] += t.pnl_pct
-
-                    st.subheader("📊 Выходы по причинам")
-                    rcols = st.columns(len(reasons))
-                    for col, (reason, stats) in zip(rcols, reasons.items()):
-                        avg = stats['pnl'] / stats['count']
-                        col.metric(
-                            reason.replace('_', ' '),
-                            f"{stats['count']} сделок",
-                            f"avg {avg:+.2f}%"
-                        )
-
-        except Exception as e:
-            st.error(f"❌ Ошибка: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+elif mode == "🔄 Автоскан":
+    if st.button("🚀 Запустить автоскан", type="primary"):
+        ex, actual_exchange = get_exchange(exchange_name)
+        if ex is None:
+            st.error("❌ Все биржи недоступны")
+            st.stop()
+        
+        # Get top coins
+        with st.spinner("Загружаю список монет..."):
+            try:
+                tickers = ex.fetch_tickers()
+                usdt = {k: v for k, v in tickers.items() 
+                       if '/USDT' in k and ':' not in k}
+                
+                valid = []
+                for sym, t in usdt.items():
+                    try:
+                        vol = float(t.get('quoteVolume', 0))
+                        if vol > 0:
+                            valid.append((sym.replace('/USDT', ''), vol))
+                    except:
+                        continue
+                
+                valid.sort(key=lambda x: -x[1])
+                coins = [c[0] for c in valid[:n_coins]]
+                st.info(f"📊 Топ {len(coins)} монет с {actual_exchange.upper()}")
+            except Exception as e:
+                st.error(f"❌ {e}")
+                st.stop()
+        
+        # Download prices
+        hpb_map = {'1h': 24, '4h': 6, '1d': 1}
+        limit = lookback_days * hpb_map.get(timeframe, 6)
+        
+        prices = {}
+        progress = st.progress(0, "Загружаю данные...")
+        for i, coin in enumerate(coins):
+            progress.progress((i+1)/len(coins), f"📥 {coin} ({i+1}/{len(coins)})")
+            try:
+                ohlcv = ex.fetch_ohlcv(f"{coin}/USDT", timeframe, limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['ts','o','h','l','c','v'])
+                if len(df) >= 100:
+                    prices[coin] = df['c'].values
+            except:
+                continue
+        
+        progress.empty()
+        st.info(f"✅ Данные для {len(prices)} монет")
+        
+        # Quick cointegration scan → top pairs
+        st.info("🔍 Поиск коинтегрированных пар...")
+        coint_pairs = []
+        coin_list = list(prices.keys())
+        
+        scan_progress = st.progress(0, "Тестирую пары...")
+        total = len(coin_list) * (len(coin_list) - 1) // 2
+        done = 0
+        
+        for i, c1 in enumerate(coin_list):
+            for c2 in coin_list[i+1:]:
+                done += 1
+                if done % 100 == 0:
+                    scan_progress.progress(done / total, f"Фаза 1: {done}/{total}")
+                
+                n = min(len(prices[c1]), len(prices[c2]))
+                if n < 100: continue
+                
+                try:
+                    _, pv, _ = coint(prices[c1][:n], prices[c2][:n])
+                    if pv < 0.10:
+                        coint_pairs.append((c1, c2, pv))
+                except:
+                    continue
+        
+        scan_progress.empty()
+        coint_pairs.sort(key=lambda x: x[2])
+        coint_pairs = coint_pairs[:max_pairs_bt]
+        
+        st.info(f"🔬 Найдено {len(coint_pairs)} пар с p<0.10. Бэктестирую топ {max_pairs_bt}...")
+        
+        # Run backtests
+        results_list = []
+        bt_progress = st.progress(0, "Бэктесты...")
+        
+        for idx, (c1, c2, pv) in enumerate(coint_pairs):
+            bt_progress.progress((idx+1)/len(coint_pairs), f"Бэктест {c1}/{c2} ({idx+1}/{len(coint_pairs)})")
+            
+            n = min(len(prices[c1]), len(prices[c2]))
+            result, error = run_backtest(
+                prices[c1][:n], prices[c2][:n],
+                timeframe=timeframe,
+                entry_z=entry_z, exit_z=exit_z, stop_z=stop_z,
+                max_bars=max_bars, min_bars=min_bars,
+                commission_pct=commission, adaptive_entry=adaptive_entry
+            )
+            
+            if result and result['stats']:
+                s = result['stats']
+                pt = result['pre_trade']
+                results_list.append({
+                    'Пара': f"{c1}/{c2}",
+                    'P-val': round(pv, 4),
+                    'Hurst': round(pt['hurst'], 3),
+                    'HL(ч)': round(pt['hl_hours'], 0) if pt['hl_hours'] < 999 else '∞',
+                    'HR': round(pt['hr'], 4),
+                    'Сделок': s['n_trades'],
+                    'Win%': round(s['win_rate'], 0),
+                    'Total P&L': f"{s['total_pnl']:+.1f}%",
+                    'Avg P&L': f"{s['avg_pnl']:+.2f}%",
+                    'MaxDD': f"{s['max_dd']:.1f}%",
+                    'Sharpe': round(s['sharpe'], 1),
+                    'PF': round(s['profit_factor'], 2),
+                })
+        
+        bt_progress.empty()
+        
+        if results_list:
+            st.subheader(f"📊 Результаты автоскана ({len(results_list)} пар)")
+            
+            df_results = pd.DataFrame(results_list)
+            st.dataframe(df_results, use_container_width=True, hide_index=True)
+            
+            # Summary
+            profitable = [r for r in results_list if float(r['Total P&L'].replace('%','').replace('+','')) > 0]
+            st.info(f"✅ Прибыльных: {len(profitable)}/{len(results_list)} ({len(profitable)/len(results_list)*100:.0f}%)")
+            
+            # CSV
+            csv = df_results.to_csv(index=False)
+            st.download_button("📥 Скачать результаты (CSV)", csv,
+                             f"autoscan_{actual_exchange}_{timeframe}_{datetime.now().strftime('%Y%m%d')}.csv",
+                             "text/csv")
+        else:
+            st.warning("❌ Ни одна пара не показала результатов")
 
 else:
-    # ═══ АВТОСКАН v2 ═══
-    st.subheader("🔍 Автоматический скан + бэктест")
-    st.caption("v2: фильтрует стейблкоины, HR < 0.01 и HR > 20, Hurst > 0.50")
+    st.info("👆 Выберите режим и нажмите Запустить")
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        n_coins = st.slider("Количество монет", 10, 50, 20,
-                            help="Больше монет = больше пар = дольше")
-    with col2:
-        run_scan = st.button("🔍 Сканировать и тестировать", type="primary",
-                            use_container_width=True)
-
-    if run_scan:
-        progress = st.progress(0, "Инициализация...")
-
-        try:
-            coins = get_top_coins_cached(exchange, n_coins)
-            # v2: Фильтр стейблкоинов
-            coins = [c for c in coins if c.upper() not in STABLECOIN_KEYWORDS]
-            st.info(f"📊 Монеты ({len(coins)}): {', '.join(coins[:20])}{'...' if len(coins) > 20 else ''}")
-
-            all_results = scan_and_backtest(
-                exchange, coins, timeframe, lookback,
-                entry_z, exit_z, stop_z, max_hold, min_hold,
-                commission, progress
-            )
-
-            progress.progress(1.0, "Готово!")
-            time.sleep(0.3)
-            progress.empty()
-
-            if not all_results:
-                st.warning("⚠️ Ни одной пары с торговыми сигналами")
-            else:
-                all_results.sort(key=lambda x: -x['result'].total_pnl)
-
-                st.success(f"✅ Протестировано {len(all_results)} пар с торговыми сигналами")
-
-                summary = []
-                for r in all_results:
-                    bt = r['result']
-                    summary.append({
-                        'Пара': f"{r['coin1']}/{r['coin2']}",
-                        'P-val': f"{r['pvalue']:.4f}",
-                        'Hurst': f"{r['hurst']:.3f}",
-                        'HL(ч)': f"{r['halflife_h']:.0f}",
-                        'HR': f"{r['hr']:.4f}",
-                        'Сделок': bt.total_trades,
-                        'Win%': f"{bt.win_rate:.0f}",
-                        'Total P&L': f"{bt.total_pnl:+.1f}%",
-                        'Avg P&L': f"{bt.avg_pnl:+.2f}%",
-                        'MaxDD': f"{bt.max_drawdown:.1f}%",
-                        'Sharpe': f"{bt.sharpe:.1f}",
-                        'PF': f"{bt.profit_factor:.2f}",
-                    })
-
-                df_summary = pd.DataFrame(summary)
-                st.dataframe(df_summary, use_container_width=True, hide_index=True)
-
-                st.divider()
-                st.subheader("📈 Детали по парам")
-
-                for r in all_results[:10]:
-                    bt = r['result']
-                    with st.expander(
-                        f"{'🟢' if bt.total_pnl > 0 else '🔴'} "
-                        f"{r['coin1']}/{r['coin2']} — "
-                        f"P&L: {bt.total_pnl:+.1f}% | "
-                        f"{bt.total_trades} сделок | "
-                        f"WR: {bt.win_rate:.0f}%"
-                    ):
-                        mc1, mc2, mc3, mc4 = st.columns(4)
-                        mc1.metric("Total P&L", f"{bt.total_pnl:+.1f}%")
-                        mc2.metric("Win Rate", f"{bt.win_rate:.0f}%")
-                        mc3.metric("Sharpe", f"{bt.sharpe:.1f}")
-                        mc4.metric("Max DD", f"{bt.max_drawdown:.1f}%")
-
-                        fig = plot_backtest_results(bt, r['coin1'], r['coin2'])
-                        st.plotly_chart(fig, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"❌ Ошибка: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-
-# Footer
 st.divider()
-st.caption("""
-**Pairs Trading Backtester v3.0** | Kalman Filter HR + MAD Z-Score + Walk-Forward
-
-⚠️ Это бэктест — реальная торговля может отличаться из-за проскальзывания, ликвидности, задержек исполнения.
-
-**Изменения v3.0:**
-- ✅ **[CRITICAL]** Half-life: исправлен перевод дни→часы (halflife_ou × 24)
-- ✅ **[CRITICAL]** Pre-trade фильтры: Hurst ≥ 0.45, P-value ≥ 0.05, HL вне диапазона → warning
-- ✅ Адаптивный min_hold = max(3, HL_bars × 0.5)
-- ✅ Адаптивный cooldown = max(3, HL_bars × 0.75)
-- ✅ Min hold bars — не выходим раньше N баров (кроме стопа)
-- ✅ OVERSHOOT — выход только при полной смене знака Z
-- ✅ HR фильтр: 0.01 < |HR| < 20 (отсечка стейблкоинов и экстремальных пар)
-- ✅ Единый DFA Hurst (синхронизирован с сканером v10.5)
-- ✅ OU Half-life (вместо OLS, как в сканере)
-- ✅ Cooldown после закрытия
-- ✅ Улучшенная палитра: зелёный/красный/жёлтый + зоны на графиках
-""")
+st.caption("⚠️ Disclaimer: Только для образовательных целей. Не является финансовой рекомендацией.")
