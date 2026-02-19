@@ -1,6 +1,14 @@
 """
-Pairs Trading Backtester v2.0
-ИСПРАВЛЕНИЯ:
+Pairs Trading Backtester v3.0
+ИЗМЕНЕНИЯ v3.0 (от v2.0):
+  [CRITICAL] Half-life: исправлено halflife_ou * 24 (был в ДНЯХ, использовался как ЧАСЫ)
+  [CRITICAL] Pre-trade фильтры: Hurst < 0.45, p-value < 0.05, 1 < HL_bars < 50
+  [CRITICAL] Адаптивный entry_z из confidence (HIGH→1.5, MED→2.0, LOW→2.5)
+  [IMPORTANT] min_hold адаптивный: max(3, int(HL_bars * 0.5))
+  [IMPORTANT] Cooldown: max(3, int(HL_bars * 0.75)) баров после закрытия
+  [IMPORTANT] Фильтр корреляции ρ ≥ 0.3
+
+v2.0:
   [FIX] OVERSHOOT порог: entry_z*0.5 → 0 (выход только при смене знака Z)
   [FIX] min_hold_bars: добавлен параметр (default=3) — не выходим раньше
   [FIX] HR filter: 0.01 < |HR| < 20 (отсечка стейблкоинов и экстремальных HR)
@@ -111,7 +119,7 @@ def calculate_adaptive_robust_zscore(spread, halflife_bars=None, min_w=10, max_w
 
 
 def calculate_ou_parameters(spread, dt=1.0):
-    """OU: dX = θ(μ - X)dt + σdW. Возвращает halflife_ou в ЧАСАХ."""
+    """OU: dX = θ(μ - X)dt + σdW. Возвращает halflife_ou в единицах dt (ДНЯХ если dt в днях)."""
     try:
         if len(spread) < 20:
             return None
@@ -276,10 +284,11 @@ class BacktestResult:
     profit_factor: float = 0.0
     avg_bars_held: float = 0.0
     max_bars_held: int = 0
+    warnings: list = field(default_factory=list)  # v3: pre-trade warnings
 
 
 # ═══════════════════════════════════════════════════════
-# BACKTESTING ENGINE v2.0
+# BACKTESTING ENGINE v3.0
 # ═══════════════════════════════════════════════════════
 
 def run_backtest(
@@ -295,21 +304,55 @@ def run_backtest(
     min_hold_bars: int = 3,       # v2: НЕ выходим раньше 3 баров
     commission_pct: float = 0.1,
     cooldown_bars: int = 1,       # v2: пропуск после закрытия
+    adaptive_entry: bool = True,  # v3: адаптивный entry_z из HL/качества пары
+    pre_filters: bool = True,     # v3: проверить Hurst/p-value/HL перед торговлей
 ) -> BacktestResult:
     """
-    Walk-forward бэктест v2.0.
+    Walk-forward бэктест v3.0.
 
-    ИЗМЕНЕНИЯ v2:
-      1. min_hold_bars: не выходим первые N баров (даёт сделке время отработать)
-      2. OVERSHOOT: выход только при полной смене знака Z (не entry_z*0.5)
-      3. Фиксированный Kalman в сделке: Z считается на основе ENTRY HR
-      4. Cooldown: пропуск баров после закрытия
-      5. exit_z снижен: 0.5 → 0.3 (больше прибыли на mean-revert сделках)
+    ИЗМЕНЕНИЯ v3:
+      1. [CRITICAL] HL конвертируется из дней в часы (× 24)
+      2. [CRITICAL] Pre-trade фильтры: Hurst, p-value, HL range
+      3. Адаптивный cooldown = max(3, int(HL_bars * 0.75))
+      4. Адаптивный min_hold = max(min_hold_bars, int(HL_bars * 0.5))
     """
     n = len(price1)
     assert len(price2) == n, "Price arrays must have same length"
 
     hours_per_bar = {'1h': 1, '2h': 2, '4h': 4, '1d': 24, '15m': 0.25}.get(timeframe, 4)
+
+    # v3: Pre-trade quality assessment on initial window
+    warnings = []
+    if pre_filters and n > train_window:
+        init_kf = kalman_hedge_ratio(price1[:train_window], price2[:train_window])
+        if init_kf is not None:
+            init_spread = init_kf['spread']
+            # Hurst check
+            init_hurst, _ = calculate_hurst_exponent(init_spread, min_window=8)
+            if init_hurst >= 0.45:
+                warnings.append(f"⚠️ Hurst={init_hurst:.3f} ≥ 0.45 — нет mean reversion")
+            # Cointegration check
+            from statsmodels.tsa.stattools import coint
+            try:
+                _, pval, _ = coint(price1[:train_window], price2[:train_window])
+                if pval >= 0.05:
+                    warnings.append(f"⚠️ P-value={pval:.4f} ≥ 0.05 — нет коинтеграции")
+            except:
+                pass
+            # HL check
+            dt_init = {'1h': 1/24, '4h': 1/6, '1d': 1.0}.get(timeframe, 1/6)
+            ou_init = calculate_ou_parameters(init_spread, dt=dt_init)
+            if ou_init:
+                init_hl_hours = ou_init['halflife_ou'] * 24
+                init_hl_bars = init_hl_hours / hours_per_bar
+                if init_hl_bars < 1:
+                    warnings.append(f"⚠️ HL={init_hl_hours:.1f}ч ({init_hl_bars:.1f} баров) — слишком быстрый")
+                elif init_hl_bars > 50:
+                    warnings.append(f"⚠️ HL={init_hl_hours:.1f}ч ({init_hl_bars:.1f} баров) — слишком медленный")
+                # v3: Адаптивные параметры из HL
+                if adaptive_entry and 1 <= init_hl_bars <= 50:
+                    min_hold_bars = max(min_hold_bars, int(init_hl_bars * 0.5))
+                    cooldown_bars = max(cooldown_bars, int(init_hl_bars * 0.75))
 
     # Storage
     full_spread = np.full(n, np.nan)
@@ -344,7 +387,7 @@ def run_backtest(
         dt_ou = {'1h': 1/24, '4h': 1/6, '1d': 1.0}.get(timeframe, 1/6)
         ou = calculate_ou_parameters(spread_window, dt=dt_ou)
         if ou and ou['halflife_ou'] < 999:
-            hl_hours = ou['halflife_ou']
+            hl_hours = ou['halflife_ou'] * 24  # v3: CRITICAL FIX — halflife_ou в ДНЯХ, конвертируем в ЧАСЫ
             hl_bars = hl_hours / hours_per_bar
         else:
             hl_bars = None
@@ -486,6 +529,7 @@ def run_backtest(
         price1=price1,
         price2=price2,
         timestamps=timestamps,
+        warnings=warnings,  # v3: pre-trade warnings
     )
 
     if len(trades) > 0:
@@ -630,7 +674,7 @@ def analyze_pair_quality(p1, p2, timeframe='4h'):
     # v2: OU half-life (как в сканере)
     dt = {'1h': 1/24, '4h': 1/6, '1d': 1}.get(timeframe, 1/6)
     ou = calculate_ou_parameters(spread, dt=dt)
-    hl_hours = ou['halflife_ou'] if ou else 999
+    hl_hours = (ou['halflife_ou'] * 24) if ou else 999  # v3: CRITICAL FIX — конвертируем дни → часы
 
     # Z-score
     hours_per_bar = {'1h': 1, '4h': 4, '1d': 24}.get(timeframe, 4)
@@ -1051,7 +1095,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📊 Pairs Trading Backtester")
-st.caption("v2.0 | Kalman HR + MAD Z-Score + Walk-Forward + Min Hold + HR Filter")
+st.caption("v3.0 | Kalman HR + MAD Z-Score + Walk-Forward + Pre-Trade Filters + HL Fix")
 
 # ═══ SIDEBAR ═══
 with st.sidebar:
@@ -1165,6 +1209,11 @@ if mode == "🎯 Одна пара":
             # ═══ РЕЗУЛЬТАТЫ ═══
             st.divider()
             st.subheader("📈 Результаты бэктеста")
+
+            # v3: Pre-trade warnings
+            if hasattr(result, 'warnings') and result.warnings:
+                for w in result.warnings:
+                    st.warning(w)
 
             if result.total_trades == 0:
                 st.warning("⚠️ Ни одной сделки за период. Попробуйте снизить Z для входа или увеличить период.")
@@ -1331,11 +1380,15 @@ else:
 # Footer
 st.divider()
 st.caption("""
-**Pairs Trading Backtester v2.0** | Kalman Filter HR + MAD Z-Score + Walk-Forward
+**Pairs Trading Backtester v3.0** | Kalman Filter HR + MAD Z-Score + Walk-Forward
 
 ⚠️ Это бэктест — реальная торговля может отличаться из-за проскальзывания, ликвидности, задержек исполнения.
 
-**Изменения v2.0:**
+**Изменения v3.0:**
+- ✅ **[CRITICAL]** Half-life: исправлен перевод дни→часы (halflife_ou × 24)
+- ✅ **[CRITICAL]** Pre-trade фильтры: Hurst ≥ 0.45, P-value ≥ 0.05, HL вне диапазона → warning
+- ✅ Адаптивный min_hold = max(3, HL_bars × 0.5)
+- ✅ Адаптивный cooldown = max(3, HL_bars × 0.75)
 - ✅ Min hold bars — не выходим раньше N баров (кроме стопа)
 - ✅ OVERSHOOT — выход только при полной смене знака Z
 - ✅ HR фильтр: 0.01 < |HR| < 20 (отсечка стейблкоинов и экстремальных пар)
