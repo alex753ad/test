@@ -501,7 +501,7 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
 
 st.set_page_config(page_title="Pairs Backtester", page_icon="📊", layout="wide")
 st.title("📊 Pairs Trading Backtester")
-st.caption("v6.0 | Fixed Hurst (DFA on increments) + Hard Pre-Filters + Trailing Stop + Walk-Forward")
+st.caption("v6.2 | 20.02.2026 | Fixed Hurst (DFA) + Pre-Filters + Trailing Stop + Walk-Forward + CSV")
 
 with st.sidebar:
     st.header("⚙️ Настройки")
@@ -646,10 +646,35 @@ if mode == "🔍 Одна пара":
                         for i, t in enumerate(result['trades'])]
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             
-            # CSV
-            df_exp = pd.DataFrame([{'Pair': f"{coin1}/{coin2}", **{k: v for k, v in t.items() if k != 'entry_hr'}} for t in result['trades']])
-            st.download_button("📥 CSV", df_exp.to_csv(index=False),
-                             f"bt_{coin1}_{coin2}_{timeframe}_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
+            # CSV — trades + pre-trade summary
+            export_trades = []
+            for i, t in enumerate(result['trades']):
+                export_trades.append({
+                    'Pair': f"{coin1}/{coin2}", 'TF': timeframe,
+                    '#': i+1, 'Direction': t['direction'],
+                    'Entry_Z': t['entry_z'], 'Exit_Z': t['exit_z'],
+                    'Bars': t['bars_held'], 'PnL%': t['pnl_pct'],
+                    'PnL_gross%': t['pnl_gross'], 'Best_PnL%': t['best_pnl'],
+                    'Exit_Type': t['exit_type'],
+                })
+            df_trades = pd.DataFrame(export_trades)
+            
+            # Pre-trade summary row
+            summary = pd.DataFrame([{
+                'Pair': f"{coin1}/{coin2}", 'TF': timeframe,
+                '#': 'SUMMARY', 'Direction': f"Trades={s['n_trades']}",
+                'Entry_Z': f"Hurst={pt['hurst']:.3f}", 
+                'Exit_Z': f"HL={pt['hl_hours']:.0f}h",
+                'Bars': f"HR={pt['hr']:.4f}",
+                'PnL%': s['total_pnl'],
+                'PnL_gross%': f"WR={s['win_rate']:.0f}%",
+                'Best_PnL%': f"PF={s['profit_factor']:.2f}",
+                'Exit_Type': f"Sharpe={s['sharpe']:.1f}",
+            }])
+            df_full = pd.concat([summary, df_trades], ignore_index=True)
+            
+            st.download_button("📥 Скачать результат (CSV)", df_full.to_csv(index=False),
+                f"backtest_{coin1}_{coin2}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
         elif error:
             st.warning(f"⚠️ {error}")
 
