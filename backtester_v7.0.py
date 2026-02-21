@@ -39,6 +39,7 @@ try:
         detect_spread_regime as _mra_regime,
         calc_halflife_from_spread as _mra_halflife,
         cusum_structural_break as _mra_cusum,
+        johansen_test as _mra_johansen,
     )
     _USE_MRA = True
 except ImportError:
@@ -588,7 +589,7 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
 
 st.set_page_config(page_title="Pairs Backtester", page_icon="📊", layout="wide")
 st.title("📊 Pairs Trading Backtester")
-st.caption("v9.0 | 21.02.2026 | CUSUM+Z + FDR AutoScan + Moscow time + Johansen import")
+st.caption("v10.0 | 21.02.2026 | CUSUM+Z + Johansen + Moscow time + Cost-aware")
 
 with st.sidebar:
     st.header("⚙️ Настройки")
