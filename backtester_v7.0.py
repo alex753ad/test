@@ -15,7 +15,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import ccxt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+MSK = timezone(timedelta(hours=3))
+def now_msk():
+    return datetime.now(MSK)
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from statsmodels.tsa.stattools import coint
@@ -344,16 +348,25 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
     cusum_break = False
     if _USE_MRA and len(train_spread) >= 60:
         try:
-            cusum_info = _mra_cusum(train_spread, min_tail=min(30, len(train_spread) // 5))
+            # Approximate current Z for CUSUM amplifier
+            approx_z = 0
+            if len(train_spread) > 20:
+                mu = np.mean(train_spread[-30:])
+                sd = np.std(train_spread[-30:])
+                if sd > 1e-10:
+                    approx_z = (train_spread[-1] - mu) / sd
+            cusum_info = _mra_cusum(train_spread, 
+                                    min_tail=min(30, len(train_spread) // 5),
+                                    zscore=approx_z)
             if cusum_info.get('has_break'):
                 filter_fail = True
                 cusum_break = True
                 filter_reasons.append(
-                    f"CUSUM BREAK: score={cusum_info['cusum_score']:.1f}σ, "
-                    f"drift={cusum_info['tail_drift']:+.1f}σ (коинтеграция сломана)")
-            elif cusum_info.get('cusum_score', 0) > 2.5:
+                    f"CUSUM BREAK: {cusum_info.get('risk_level','?')} "
+                    f"score={cusum_info['cusum_score']:.1f}σ")
+            elif cusum_info.get('risk_level') == 'HIGH':
                 filter_reasons.append(
-                    f"⚠️ CUSUM={cusum_info['cusum_score']:.1f}σ (возможный сдвиг)")
+                    f"⚠️ CUSUM HIGH: score={cusum_info['cusum_score']:.1f}σ")
         except Exception:
             pass
     
@@ -575,7 +588,7 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
 
 st.set_page_config(page_title="Pairs Backtester", page_icon="📊", layout="wide")
 st.title("📊 Pairs Trading Backtester")
-st.caption("v8.0 | 21.02.2026 | CUSUM Break + FDR AutoScan + P-value Gate + Slippage + ADX")
+st.caption("v9.0 | 21.02.2026 | CUSUM+Z + FDR AutoScan + Moscow time + Johansen import")
 
 with st.sidebar:
     st.header("⚙️ Настройки")
@@ -751,7 +764,7 @@ if mode == "🔍 Одна пара":
             df_full = pd.concat([summary, df_trades], ignore_index=True)
             
             st.download_button("📥 Скачать результат (CSV)", df_full.to_csv(index=False),
-                f"backtest_{coin1}_{coin2}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
+                f"backtest_{coin1}_{coin2}_{timeframe}_{now_msk().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
         elif error:
             st.warning(f"⚠️ {error}")
 
@@ -887,7 +900,7 @@ elif mode == "🔄 Автоскан":
             st.info(f"✅ Торговали: {len(traded)}, Отфильтровано: {len(filtered)}, Прибыльных: {len(profitable)}")
             
             st.download_button("📥 CSV", df_r.to_csv(index=False),
-                f"autoscan_{actual}_{timeframe}_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
+                f"autoscan_{actual}_{timeframe}_{now_msk().strftime('%Y%m%d')}.csv", "text/csv")
 
 st.divider()
 st.caption("⚠️ Только для образовательных целей. Не является финансовой рекомендацией.")
