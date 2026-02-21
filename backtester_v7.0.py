@@ -34,6 +34,7 @@ try:
         calculate_confidence as _mra_confidence,
         detect_spread_regime as _mra_regime,
         calc_halflife_from_spread as _mra_halflife,
+        cusum_structural_break as _mra_cusum,
     )
     _USE_MRA = True
 except ImportError:
@@ -339,6 +340,23 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
     if abs(hr_final) > 5:
         filter_reasons.append(f"⚠️ |HR|={abs(hr_final):.1f} > 5 (капитальный дисбаланс)")
     
+    # v12.0: CUSUM structural break test
+    cusum_break = False
+    if _USE_MRA and len(train_spread) >= 60:
+        try:
+            cusum_info = _mra_cusum(train_spread, min_tail=min(30, len(train_spread) // 5))
+            if cusum_info.get('has_break'):
+                filter_fail = True
+                cusum_break = True
+                filter_reasons.append(
+                    f"CUSUM BREAK: score={cusum_info['cusum_score']:.1f}σ, "
+                    f"drift={cusum_info['tail_drift']:+.1f}σ (коинтеграция сломана)")
+            elif cusum_info.get('cusum_score', 0) > 2.5:
+                filter_reasons.append(
+                    f"⚠️ CUSUM={cusum_info['cusum_score']:.1f}σ (возможный сдвиг)")
+        except Exception:
+            pass
+    
     # Quality score (simplified)
     q_score = max(0, min(100,
         (25 if pvalue < 0.01 else 12 if pvalue < 0.05 else 0) +
@@ -557,7 +575,7 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
 
 st.set_page_config(page_title="Pairs Backtester", page_icon="📊", layout="wide")
 st.title("📊 Pairs Trading Backtester")
-st.caption("v7.0 | 20.02.2026 | P-value gate + HR min + Slippage + ADX + DRY imports + Ridge Kalman")
+st.caption("v8.0 | 21.02.2026 | CUSUM Break + FDR AutoScan + P-value Gate + Slippage + ADX")
 
 with st.sidebar:
     st.header("⚙️ Настройки")
