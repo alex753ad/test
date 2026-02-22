@@ -434,13 +434,15 @@ def run_backtest(prices1, prices2, timeframe='4h', entry_z=2.0, exit_z=0.3,
         
         # ═══ OPEN ═══
         if position is None and (i - last_close_bar) > cooldown:
-            if z > entry_z:
+            # v17: PRE-ENTRY GUARD — don't open if Z already past stop level
+            # This eliminates Bars=0 STOP_LOSS phantom trades (PnL_gross=0.0)
+            if z > entry_z and z < adaptive_stop:
                 position = {
                     'entry_bar': i, 'direction': 'SHORT',
                     'entry_z': z, 'entry_p1': p1[i], 'entry_p2': p2[i],
                     'entry_hr': hrs[i], 'best_pnl': 0, 'trailing_active': False,
                 }
-            elif z < -entry_z:
+            elif z < -entry_z and z > -adaptive_stop:
                 position = {
                     'entry_bar': i, 'direction': 'LONG',
                     'entry_z': z, 'entry_p1': p1[i], 'entry_p2': p2[i],
